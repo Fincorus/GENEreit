@@ -265,6 +265,7 @@ def main_menu_keyboard():
     return builder.as_markup()
 
 # ========================= GIGACHAT API =========================
+# ==================== GIGACHAT API ====================
 async def get_gigachat_token() -> str | None:
     """Получает access token для GigaChat API с кешированием на 25 минут"""
     global _gigachat_token_cache
@@ -302,15 +303,11 @@ async def get_gigachat_token() -> str | None:
             expires_at = data.get("expires_at")
             
             if expires_at:
-                if isinstance(expires_at, (int, float)):
-                    if expires_at > 1_000_000_000:
-                        # Это timestamp (секунды с 1970)
-                        expires_dt = datetime.fromtimestamp(expires_at)
-                    else:
-                        # Это количество секунд до истечения
-                        expires_dt = now + timedelta(seconds=expires_at - 300)
+                # Если значение меньше 1 миллиарда — это секунды, иначе timestamp
+                if expires_at < 1_000_000_000:
+                    expires_dt = now + timedelta(seconds=expires_at - 300)
                 else:
-                    expires_dt = now + timedelta(minutes=25)
+                    expires_dt = datetime.fromtimestamp(expires_at)
             else:
                 expires_dt = now + timedelta(minutes=25)
             
@@ -334,12 +331,15 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
         "Accept": "application/json"
     }
     
+    # Явно указываем, что нужно сгенерировать изображение
+    full_prompt = f"Создай изображение: {prompt}"
+    
     payload = {
         "model": "GigaChat",
         "messages": [
             {
                 "role": "user",
-                "content": prompt
+                "content": full_prompt
             }
         ],
         "function_call": "auto"
@@ -354,8 +354,9 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
             data = await resp.json()
             
             message_content = data["choices"][0]["message"]["content"]
-            logging.info(f"GigaChat response: {message_content[:200]}")
+            logging.info(f"GigaChat response: {message_content[:500]}")
             
+            # Ищем UUID изображения
             match = re.search(r'<img src="([a-f0-9-]+)"', message_content)
             if not match:
                 match = re.search(r'uuid:([a-f0-9-]+)', message_content)
@@ -363,6 +364,7 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
                 match = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', message_content)
             if not match:
                 logging.error("No image UUID in response")
+                logging.error(f"Full response: {message_content}")
                 return None
             file_id = match.group(1)
             logging.info(f"Image UUID: {file_id}")
@@ -373,24 +375,24 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
             "Accept": "image/jpeg"
         }
         
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
         
-        for attempt in range(5):
+        for attempt in range(10):
             async with session.get(download_url, headers=headers_download, ssl=False) as resp:
                 if resp.status == 200:
                     image_bytes = await resp.read()
                     if image_bytes and len(image_bytes) > 1000:
                         return image_bytes
-                    logging.warning(f"Download attempt {attempt+1}: empty image")
+                    logging.warning(f"Download attempt {attempt+1}: empty image ({len(image_bytes)} bytes)")
                 elif resp.status == 404:
-                    logging.info(f"Image not ready yet (attempt {attempt+1}/5)")
+                    logging.info(f"Image not ready yet (attempt {attempt+1}/10)")
                 else:
                     text = await resp.text()
                     logging.error(f"Download error {resp.status}: {text}")
             
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
         
-        logging.error("Failed to download image after 5 attempts")
+        logging.error("Failed to download image after 10 attempts")
         return None
 
 # ========================= БОТ =========================
