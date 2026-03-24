@@ -263,6 +263,27 @@ def main_menu_keyboard():
     builder.adjust(2)
     return builder.as_markup()
 
+def after_generation_keyboard(prompt: str, style: str, is_free: bool = False):
+    """Клавиатура, которая появляется после генерации"""
+    builder = InlineKeyboardBuilder()
+    
+    # Кнопка для повторной генерации с тем же промтом (обрезаем для callback_data)
+    short_prompt = prompt[:50].replace("|", " ").replace("\n", " ")
+    builder.button(text="🔄 Сгенерировать ещё", callback_data=f"regenerate|{short_prompt}|{style}")
+    
+    # Кнопка выбора стиля
+    builder.button(text="🎨 Выбрать стиль", callback_data="show_styles")
+    
+    # Кнопка статуса
+    builder.button(text="📊 Статус", callback_data="show_status")
+    
+    # Если бесплатная генерация, показываем кнопку подписки
+    if is_free:
+        builder.button(text="💎 Купить подписку", callback_data="buy_sub")
+    
+    builder.adjust(1)
+    return builder.as_markup()
+
 # ========================= GIGACHAT API =========================
 async def get_gigachat_token() -> str | None:
     """Получает access token для GigaChat API с кешированием на 25 минут"""
@@ -565,6 +586,40 @@ async def successful_payment(message: Message):
     update_subscription(message.from_user.id, days)
     await message.answer(f"✅ Подписка активирована на {days} дней!\nТеперь ты можешь генерировать безлимитно (до {DAILY_LIMIT} в день).")
 
+# ==================== ОБРАБОТЧИК РЕГЕНЕРАЦИИ ====================
+@router.callback_query(F.data.startswith("regenerate|"))
+async def regenerate_image(callback: CallbackQuery):
+    """Обработчик кнопки 'Сгенерировать ещё'"""
+    user_id = callback.from_user.id
+    update_activity(user_id)
+    
+    # Извлекаем промт и стиль из callback_data
+    data = callback.data.split("|")
+    if len(data) >= 3:
+        prompt = data[1]
+        style = data[2]
+        # Сохраняем стиль для пользователя
+        user_style[user_id] = style
+    
+    await callback.answer("🔄 Генерирую снова...")
+    
+    # Проверяем подписку или бесплатные
+    if has_active_subscription(user_id):
+        await generate_and_send(callback.message, user_id, prompt)
+    else:
+        free_left = get_free_generations(user_id)
+        if free_left > 0:
+            await generate_and_send(callback.message, user_id, prompt, is_free=True)
+        else:
+            await callback.message.answer(
+                "❌ У тебя закончились бесплатные генерации.\n\n"
+                "Купи подписку, чтобы продолжать генерировать!",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="💎 Купить подписку", callback_data="buy_sub")
+                ]])
+            )
+
+# ==================== ОБРАБОТЧИК ТЕКСТА ====================
 @router.message(F.text)
 async def handle_prompt(message: Message):
     user_id = message.from_user.id
@@ -572,6 +627,7 @@ async def handle_prompt(message: Message):
     
     prompt = message.text.strip()
     
+    # Если это команда — пропускаем
     if prompt.startswith('/'):
         return
     
@@ -593,8 +649,9 @@ async def handle_prompt(message: Message):
             ]])
         )
 
+# ==================== ФУНКЦИЯ ГЕНЕРАЦИИ И ОТПРАВКИ ====================
 async def generate_and_send(message: Message, user_id: int, prompt: str, is_free: bool = False):
-    """Общая функция генерации и отправки (GigaChat)"""
+    """Общая функция генерации и отправки (GigaChat) с клавиатурой после генерации"""
     style = user_style.get(user_id, "none")
     
     style_prompts = {
@@ -626,17 +683,22 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
         else:
             free_text = ""
         
-        # Отправляем изображение через BufferedInputFile
+        # Отправляем изображение
         photo_file = BufferedInputFile(image_bytes, filename="image.jpg")
+        
+        # Формируем клавиатуру для после генерации
+        reply_markup = after_generation_keyboard(prompt, style, is_free)
         
         await message.answer_photo(
             photo=photo_file,
-            caption=f"✨ Готово! (GigaChat)\nСтиль: {style}\nПромт: {prompt[:80]}...{free_text}"
+            caption=f"✨ Готово! (GigaChat)\nСтиль: {style}\nПромт: {prompt[:80]}...{free_text}",
+            reply_markup=reply_markup
         )
         save_to_history(user_id, prompt, "gigachat_generated")
     else:
         await message.answer("⚠️ Ошибка генерации. Попробуй другой промт или повтори позже.")
 
+# ==================== ОСТАЛЬНЫЕ КОМАНДЫ ====================
 @router.message(Command("subscribe"))
 async def cmd_subscribe(message: Message):
     await message.answer("💎 Выбери подписку:", reply_markup=subscribe_keyboard())
