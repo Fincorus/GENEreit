@@ -29,7 +29,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 # GigaChat credentials (Authorization Key из личного кабинета)
-GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")  # строка base64, без слова "Basic"
+GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")
 GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 
 # Кеш для токена GigaChat
@@ -279,7 +279,6 @@ async def get_gigachat_token() -> str | None:
     
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     
-    # GigaChat использует Basic Auth
     auth_header = f"Basic {GIGACHAT_CREDENTIALS}"
     
     headers = {
@@ -300,12 +299,24 @@ async def get_gigachat_token() -> str | None:
                 return None
             data = await resp.json()
             token = data.get("access_token")
-            expires_in = data.get("expires_at", 1800)
+            
+            expires_at = data.get("expires_at")
+            
+            if expires_at:
+                # Если expires_at - это timestamp (число > 1e9), преобразуем
+                if isinstance(expires_at, (int, float)) and expires_at > 1e9:
+                    expires_dt = datetime.fromtimestamp(expires_at)
+                else:
+                    # Если это количество секунд
+                    expires_dt = now + timedelta(seconds=expires_at - 300)
+            else:
+                # По умолчанию 30 минут
+                expires_dt = now + timedelta(minutes=25)
             
             _gigachat_token_cache["token"] = token
-            _gigachat_token_cache["expires_at"] = now + timedelta(seconds=expires_in - 300)
+            _gigachat_token_cache["expires_at"] = expires_dt
             
-            logging.info(f"GigaChat token obtained, expires at {_gigachat_token_cache['expires_at']}")
+            logging.info(f"GigaChat token obtained, expires at {expires_dt}")
             return token
 
 async def generate_gigachat_image(prompt: str) -> bytes | None:
@@ -314,7 +325,6 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
     if not token:
         return None
     
-    # Шаг 1: отправляем запрос на генерацию
     url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
     
     headers = {
@@ -342,7 +352,6 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
                 return None
             data = await resp.json()
             
-            # Извлекаем идентификатор изображения из ответа
             message_content = data["choices"][0]["message"]["content"]
             logging.info(f"GigaChat response: {message_content[:200]}")
             
@@ -350,7 +359,6 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
             if not match:
                 match = re.search(r'uuid:([a-f0-9-]+)', message_content)
             if not match:
-                # Пробуем найти любой UUID в тексте
                 match = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', message_content)
             if not match:
                 logging.error("No image UUID in response")
@@ -358,7 +366,6 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
             file_id = match.group(1)
             logging.info(f"Image UUID: {file_id}")
         
-        # Шаг 2: скачиваем изображение
         download_url = f"https://gigachat.devices.sberbank.ru/api/v1/files/{file_id}/content"
         headers_download = {
             "Authorization": f"Bearer {token}",
@@ -477,8 +484,6 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     update_activity(user_id)
     
-    free_left = get_free_generations(user_id)
-    
     welcome_text = (
         "🌟 Привет! Я генерирую крутые картинки через нейросеть GigaChat.\n\n"
         f"🎁 **У тебя есть {FREE_GENERATIONS} бесплатных генераций!**\n\n"
@@ -589,7 +594,6 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
     """Общая функция генерации и отправки (GigaChat)"""
     style = user_style.get(user_id, "none")
     
-    # Добавляем стиль к промту
     style_prompts = {
         "photo": "в фотореалистичном стиле, высокая детализация, 8k",
         "anime": "в стиле аниме, яркие цвета, детализированные глаза",
