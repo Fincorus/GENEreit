@@ -28,8 +28,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# GigaChat credentials
-GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")
+# GigaChat credentials (Authorization Key из личного кабинета)
+GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")  # строка base64, без слова "Basic"
 GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 
 # Кеш для токена GigaChat
@@ -271,7 +271,7 @@ async def get_gigachat_token() -> str | None:
     
     now = datetime.now()
     
-    # Если токен есть и не истёк (оставим запас 5 минут)
+    # Если токен есть и не истёк
     if (_gigachat_token_cache["token"] and 
         _gigachat_token_cache["expires_at"] and 
         now < _gigachat_token_cache["expires_at"]):
@@ -279,8 +279,11 @@ async def get_gigachat_token() -> str | None:
     
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     
+    # GigaChat использует Basic Auth
+    auth_header = f"Basic {GIGACHAT_CREDENTIALS}"
+    
     headers = {
-        "Authorization": f"Bearer {GIGACHAT_CREDENTIALS}",
+        "Authorization": auth_header,
         "RqUID": str(uuid.uuid4()),
         "Content-Type": "application/x-www-form-urlencoded"
     }
@@ -293,13 +296,12 @@ async def get_gigachat_token() -> str | None:
         async with session.post(url, headers=headers, data=data, ssl=False) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                logging.error(f"GigaChat token error: {text}")
+                logging.error(f"GigaChat token error {resp.status}: {text}")
                 return None
             data = await resp.json()
             token = data.get("access_token")
-            expires_in = data.get("expires_at", 1800)  # обычно 1800 секунд (30 мин)
+            expires_in = data.get("expires_at", 1800)
             
-            # Кешируем на 25 минут (оставляем запас 5 минут)
             _gigachat_token_cache["token"] = token
             _gigachat_token_cache["expires_at"] = now + timedelta(seconds=expires_in - 300)
             
@@ -347,6 +349,9 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
             match = re.search(r'<img src="([a-f0-9-]+)"', message_content)
             if not match:
                 match = re.search(r'uuid:([a-f0-9-]+)', message_content)
+            if not match:
+                # Пробуем найти любой UUID в тексте
+                match = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', message_content)
             if not match:
                 logging.error("No image UUID in response")
                 return None
