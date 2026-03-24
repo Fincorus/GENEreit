@@ -37,9 +37,12 @@ _gigachat_token_cache = {
     "expires_at": None
 }
 
-# Лимиты (можно убрать или оставить для теста)
-DAILY_LIMIT = 100  # Безлимит, но ограничим 100 в день чтобы не перегружать API
-FREE_GENERATIONS = 10  # Бесплатных генераций (можно убрать, но оставим как тест)
+# Хранилище последнего промта пользователя
+last_user_prompt = {}
+
+# Лимиты
+DAILY_LIMIT = 100
+FREE_GENERATIONS = 10
 
 DB_FILE = "bot.db"
 
@@ -168,16 +171,12 @@ def main_menu_keyboard():
     builder.adjust(2)
     return builder.as_markup()
 
-def after_generation_keyboard(prompt: str, style: str):
-    """Клавиатура, которая появляется после генерации"""
+def after_generation_keyboard(style: str):
+    """Клавиатура, которая появляется после генерации (без промта в callback)"""
     builder = InlineKeyboardBuilder()
-    
-    short_prompt = prompt[:40].replace("|", " ").replace("\n", " ").strip()
-    
-    builder.button(text="🔄 Сгенерировать ещё", callback_data=f"reg|{short_prompt}|{style}")
-    builder.button(text="🎨 Выбрать стиль", callback_data="show_styles")
+    builder.button(text="🔄 Ещё раз", callback_data=f"reg|{style}")
+    builder.button(text="🎨 Стиль", callback_data="show_styles")
     builder.button(text="📊 Статус", callback_data="show_status")
-    
     builder.adjust(1)
     return builder.as_markup()
 
@@ -384,27 +383,30 @@ async def choose_style(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("reg|"))
 async def regenerate_image(callback: CallbackQuery):
-    """Обработчик кнопки 'Сгенерировать ещё'"""
+    """Обработчик кнопки 'Ещё раз'"""
     user_id = callback.from_user.id
     update_activity(user_id)
     
+    # Извлекаем стиль из callback_data
     data = callback.data.split("|")
-    if len(data) >= 3:
-        prompt = data[1]
-        style = data[2]
+    if len(data) >= 2:
+        style = data[1]
         user_style[user_id] = style
-    else:
-        await callback.answer("❌ Ошибка: не удалось восстановить промт")
+    
+    # Получаем последний промт пользователя
+    prompt = last_user_prompt.get(user_id)
+    if not prompt:
+        await callback.answer("❌ Не найден предыдущий промт")
         return
     
-    await callback.answer("🔄 Генерирую снова...")
+    await callback.answer("🔄 Генерирую...")
     
     free_left = get_free_generations(user_id)
     if free_left > 0:
         await generate_and_send(callback.message, user_id, prompt, is_free=True)
     else:
         await callback.message.answer(
-            "❌ У тебя закончились бесплатные генерации.\n\n"
+            "❌ Бесплатные генерации закончились.\n\n"
             "Напиши администратору, чтобы получить бонус.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="📊 Статус", callback_data="show_status")
@@ -421,13 +423,16 @@ async def handle_prompt(message: Message):
     if prompt.startswith('/'):
         return
     
+    # Сохраняем последний промт пользователя
+    last_user_prompt[user_id] = prompt
+    
     free_left = get_free_generations(user_id)
     
     if free_left > 0:
         await generate_and_send(message, user_id, prompt, is_free=True)
     else:
         await message.answer(
-            "❌ У тебя закончились бесплатные генерации.\n\n"
+            "❌ Бесплатные генерации закончились.\n\n"
             "Напиши администратору, чтобы получить бонус.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="📊 Статус", callback_data="show_status")
@@ -476,7 +481,7 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
             free_text = ""
         
         photo_file = BufferedInputFile(image_bytes, filename="image.jpg")
-        reply_markup = after_generation_keyboard(prompt[:40], style)
+        reply_markup = after_generation_keyboard(style)
         
         await message.answer_photo(
             photo=photo_file,
