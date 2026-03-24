@@ -40,6 +40,9 @@ _gigachat_token_cache = {
 # Хранилище последнего промта пользователя
 last_user_prompt = {}
 
+# Для ограничения частоты запросов
+last_request_time = {}
+
 # Лимиты
 DAILY_LIMIT = 100
 FREE_GENERATIONS = 10
@@ -234,7 +237,7 @@ async def get_gigachat_token() -> str | None:
             return token
 
 async def generate_gigachat_image(prompt: str) -> bytes | None:
-    """Генерирует изображение через GigaChat API и возвращает bytes"""
+    """Генерирует изображение через GigaChat API с повторными попытками при 429"""
     token = await get_gigachat_token()
     if not token:
         return None
@@ -266,56 +269,66 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
     }
     
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload, headers=headers, ssl=False) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                logging.error(f"GigaChat generation error {resp.status}: {text}")
-                return None
-            data = await resp.json()
-            
-            message_content = data["choices"][0]["message"]["content"]
-            logging.info(f"GigaChat response: {message_content[:300]}")
-            
-            # Проверяем отказ
-            if "не получилось" in message_content.lower() or "не удалось" in message_content.lower():
-                logging.error("GigaChat refused to generate")
-                return None
-            
-            match = re.search(r'<img src="([a-f0-9-]+)"', message_content)
-            if not match:
-                match = re.search(r'uuid:([a-f0-9-]+)', message_content)
-            if not match:
-                match = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', message_content)
-            if not match:
-                logging.error("No image UUID in response")
-                return None
-            file_id = match.group(1)
-            logging.info(f"Image UUID: {file_id}")
-        
-        download_url = f"https://gigachat.devices.sberbank.ru/api/v1/files/{file_id}/content"
-        headers_download = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "image/jpeg"
-        }
-        
-        await asyncio.sleep(3)
-        
-        for attempt in range(10):
-            async with session.get(download_url, headers=headers_download, ssl=False) as resp:
+        # Пытаемся отправить запрос с повторными попытками при 429
+        for attempt in range(3):
+            async with session.post(url, json=payload, headers=headers, ssl=False) as resp:
                 if resp.status == 200:
-                    image_bytes = await resp.read()
-                    if image_bytes and len(image_bytes) > 1000:
-                        return image_bytes
-                    logging.warning(f"Download attempt {attempt+1}: empty image ({len(image_bytes)} bytes)")
-                elif resp.status == 404:
-                    logging.info(f"Image not ready yet (attempt {attempt+1}/10)")
+                    data = await resp.json()
+                    message_content = data["choices"][0]["message"]["content"]
+                    logging.info(f"GigaChat response: {message_content[:300]}")
+                    
+                    if "не получилось" in message_content.lower() or "не удалось" in message_content.lower():
+                        logging.error("GigaChat refused to generate")
+                        return None
+                    
+                    match = re.search(r'<img src="([a-f0-9-]+)"', message_content)
+                    if not match:
+                        match = re.search(r'uuid:([a-f0-9-]+)', message_content)
+                    if not match:
+                        match = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', message_content)
+                    if not match:
+                        logging.error("No image UUID in response")
+                        return None
+                    file_id = match.group(1)
+                    logging.info(f"Image UUID: {file_id}")
+                    
+                    # Скачиваем изображение
+                    download_url = f"https://gigachat.devices.sberbank.ru/api/v1/files/{file_id}/content"
+                    headers_download = {
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "image/jpeg"
+                    }
+                    
+                    await asyncio.sleep(3)
+                    
+                    for download_attempt in range(10):
+                        async with session.get(download_url, headers=headers_download, ssl=False) as download_resp:
+                            if download_resp.status == 200:
+                                image_bytes = await download_resp.read()
+                                if image_bytes and len(image_bytes) > 1000:
+                                    return image_bytes
+                                logging.warning(f"Download attempt {download_attempt+1}: empty image")
+                            elif download_resp.status == 404:
+                                logging.info(f"Image not ready yet (attempt {download_attempt+1}/10)")
+                            else:
+                                text = await download_resp.text()
+                                logging.error(f"Download error {download_resp.status}: {text}")
+                        
+                        await asyncio.sleep(3)
+                    
+                    logging.error("Failed to download image after 10 attempts")
+                    return None
+                    
+                elif resp.status == 429:
+                    wait_time = (attempt + 1) * 5  # 5, 10, 15 секунд
+                    logging.warning(f"Rate limited (429), waiting {wait_time} seconds...")
+                    await asyncio.sleep(wait_time)
                 else:
                     text = await resp.text()
-                    logging.error(f"Download error {resp.status}: {text}")
-            
-            await asyncio.sleep(3)
+                    logging.error(f"GigaChat generation error {resp.status}: {text}")
+                    return None
         
-        logging.error("Failed to download image after 10 attempts")
+        logging.error("Failed after 3 attempts due to rate limiting")
         return None
 
 # ========================= БОТ =========================
@@ -341,7 +354,8 @@ async def cmd_start(message: Message):
         "1️⃣ Выбери стиль\n"
         "2️⃣ Отправь текстовое описание\n"
         "3️⃣ Получи картинку\n\n"
-        "✨ После бесплатных можно запросить бонус у администратора."
+        "✨ После бесплатных можно запросить бонус у администратора.\n"
+        "⏳ Обрати внимание: между запросами нужно ждать 5 секунд."
     )
     
     await message.answer(welcome_text, reply_markup=main_menu_keyboard())
@@ -387,6 +401,14 @@ async def regenerate_image(callback: CallbackQuery):
     user_id = callback.from_user.id
     update_activity(user_id)
     
+    # Проверяем частоту запросов
+    now = datetime.now()
+    last_time = last_request_time.get(user_id)
+    if last_time and (now - last_time).seconds < 5:
+        await callback.answer("⏳ Подожди 5 секунд!", show_alert=True)
+        return
+    last_request_time[user_id] = now
+    
     # Извлекаем стиль из callback_data
     data = callback.data.split("|")
     if len(data) >= 2:
@@ -416,6 +438,15 @@ async def regenerate_image(callback: CallbackQuery):
 @router.message(F.text)
 async def handle_prompt(message: Message):
     user_id = message.from_user.id
+    
+    # Ограничение частоты запросов (не чаще 1 раза в 5 секунд)
+    now = datetime.now()
+    last_time = last_request_time.get(user_id)
+    if last_time and (now - last_time).seconds < 5:
+        await message.answer("⏳ Подожди 5 секунд перед следующим запросом!")
+        return
+    last_request_time[user_id] = now
+    
     update_activity(user_id)
     
     prompt = message.text.strip()
@@ -495,7 +526,7 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
             "Попробуй:\n"
             "• Упростить промт (убрать технические детали)\n"
             "• Сделать запрос короче\n"
-            "• Использовать английский язык\n\n"
+            "• Подождать 30 секунд (лимит API)\n\n"
             "Пример: *фотореалистичный портрет девушки, зеленые глаза*"
         )
 
