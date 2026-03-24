@@ -263,8 +263,6 @@ def main_menu_keyboard():
     builder.button(text="🎁 Бесплатные", callback_data="show_free")
     builder.adjust(2)
     return builder.as_markup()
-
-# ========================= GIGACHAT API =========================
 # ==================== GIGACHAT API ====================
 async def get_gigachat_token() -> str | None:
     """Получает access token для GigaChat API с кешированием на 25 минут"""
@@ -301,6 +299,10 @@ async def get_gigachat_token() -> str | None:
             token = data.get("access_token")
             
             expires_at = data.get("expires_at")
+            
+             # ========== ДОБАВЛЕНО ЛОГИРОВАНИЕ ==========
+            logging.info(f"Raw expires_at: {expires_at}, type: {type(expires_at)}")
+            # ===========================================
             
             if expires_at:
                 # Если значение меньше 1 миллиарда — это секунды, иначе timestamp
