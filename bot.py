@@ -302,11 +302,15 @@ async def get_gigachat_token() -> str | None:
             expires_at = data.get("expires_at")
             
             if expires_at:
-                # Если значение меньше 1e9, это количество секунд
-                if isinstance(expires_at, (int, float)) and expires_at < 1e9:
-                    expires_dt = now + timedelta(seconds=expires_at - 300)
+                if isinstance(expires_at, (int, float)):
+                    if expires_at > 1_000_000_000:
+                        # Это timestamp (секунды с 1970)
+                        expires_dt = datetime.fromtimestamp(expires_at)
+                    else:
+                        # Это количество секунд до истечения
+                        expires_dt = now + timedelta(seconds=expires_at - 300)
                 else:
-                    expires_dt = datetime.fromtimestamp(expires_at)
+                    expires_dt = now + timedelta(minutes=25)
             else:
                 expires_dt = now + timedelta(minutes=25)
             
