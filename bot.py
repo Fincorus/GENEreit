@@ -300,16 +300,14 @@ async def get_gigachat_token() -> str | None:
             
             expires_at = data.get("expires_at")
             
-             # ========== ДОБАВЛЕНО ЛОГИРОВАНИЕ ==========
-            logging.info(f"Raw expires_at: {expires_at}, type: {type(expires_at)}")
-            # ===========================================
-            
             if expires_at:
-                # Если значение меньше 1 миллиарда — это секунды, иначе timestamp
-                if expires_at < 1_000_000_000:
-                    expires_dt = now + timedelta(seconds=expires_at - 300)
-                else:
+                # Определяем формат по количеству цифр
+                if expires_at > 1_000_000_000_000:  # 13+ цифр — миллисекунды
+                    expires_dt = datetime.fromtimestamp(expires_at / 1000)
+                elif expires_at > 1_000_000_000:     # 10 цифр — секунды
                     expires_dt = datetime.fromtimestamp(expires_at)
+                else:                                 # меньше — количество секунд до истечения
+                    expires_dt = now + timedelta(seconds=expires_at - 300)
             else:
                 expires_dt = now + timedelta(minutes=25)
             
