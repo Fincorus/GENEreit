@@ -28,11 +28,11 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# GigaChat credentials (Authorization Key из личного кабинета)
+# GigaChat credentials
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")
 GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 
-# Кеш для токена GigaChat
+# Кеш для токена
 _gigachat_token_cache = {
     "token": None,
     "expires_at": None
@@ -271,7 +271,6 @@ async def get_gigachat_token() -> str | None:
     
     now = datetime.now()
     
-    # Если токен есть и не истёк
     if (_gigachat_token_cache["token"] and 
         _gigachat_token_cache["expires_at"] and 
         now < _gigachat_token_cache["expires_at"]):
@@ -303,14 +302,12 @@ async def get_gigachat_token() -> str | None:
             expires_at = data.get("expires_at")
             
             if expires_at:
-                # Если expires_at - это timestamp (число > 1e9), преобразуем
-                if isinstance(expires_at, (int, float)) and expires_at > 1e9:
-                    expires_dt = datetime.fromtimestamp(expires_at)
-                else:
-                    # Если это количество секунд
+                # Если значение меньше 1e9, это количество секунд
+                if isinstance(expires_at, (int, float)) and expires_at < 1e9:
                     expires_dt = now + timedelta(seconds=expires_at - 300)
+                else:
+                    expires_dt = datetime.fromtimestamp(expires_at)
             else:
-                # По умолчанию 30 минут
                 expires_dt = now + timedelta(minutes=25)
             
             _gigachat_token_cache["token"] = token
@@ -818,10 +815,7 @@ async def health_check_server():
 async def main():
     init_db()
     
-    # Запускаем health check в фоне
     asyncio.create_task(health_check_server())
-    
-    # Запускаем напоминания
     asyncio.create_task(send_reminders())
     
     logging.info("🚀 Бот GigaChat запущен! Бесплатные генерации активны.")
