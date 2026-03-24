@@ -6,7 +6,6 @@ import uuid
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from io import BytesIO
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
@@ -14,7 +13,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    LabeledPrice, Message, PreCheckoutQuery
+    LabeledPrice, Message, PreCheckoutQuery, BufferedInputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
@@ -263,7 +262,8 @@ def main_menu_keyboard():
     builder.button(text="🎁 Бесплатные", callback_data="show_free")
     builder.adjust(2)
     return builder.as_markup()
-# ==================== GIGACHAT API ====================
+
+# ========================= GIGACHAT API =========================
 async def get_gigachat_token() -> str | None:
     """Получает access token для GigaChat API с кешированием на 25 минут"""
     global _gigachat_token_cache
@@ -626,8 +626,8 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
         else:
             free_text = ""
         
-        photo_file = BytesIO(image_bytes)
-        photo_file.name = "image.jpg"
+        # Отправляем изображение через BufferedInputFile
+        photo_file = BufferedInputFile(image_bytes, filename="image.jpg")
         
         await message.answer_photo(
             photo=photo_file,
