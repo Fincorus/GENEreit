@@ -1,0 +1,3 @@
+aiogram[fast]==3.13.0
+python-dotenv
+aiohttp
