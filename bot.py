@@ -49,7 +49,7 @@ last_request_time = {}
 # Лимиты
 DAILY_LIMIT = 100
 FREE_GENERATIONS = 10
-DAILY_BONUS = 3  # Бесплатных генераций за ежедневный бонус
+DAILY_BONUS = 3
 
 DB_FILE = "bot.db"
 
@@ -164,15 +164,10 @@ def can_claim_daily_bonus(user_id: int) -> bool:
 def claim_daily_bonus(user_id: int):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    
-    # Обновляем время бонуса
     cur.execute("INSERT OR REPLACE INTO users (user_id, last_bonus) VALUES (?, ?)", 
                 (user_id, datetime.now().isoformat()))
-    
-    # Добавляем бесплатные генерации
     cur.execute("INSERT OR REPLACE INTO free_generations (user_id, remaining) VALUES (?, COALESCE((SELECT remaining FROM free_generations WHERE user_id = ?), 10) + ?)",
                 (user_id, user_id, DAILY_BONUS))
-    
     conn.commit()
     conn.close()
 
@@ -516,40 +511,35 @@ dp.include_router(router)
 
 user_style = {}
 
-# ==================== ОБРАБОТЧИКИ ====================
-@router.message(CommandStart())
-async def cmd_start(message: Message):
-    user_id = message.from_user.id
-    update_activity(user_id)
-    
-    free_left = get_free_generations(user_id)
-    style = get_user_style(user_id)
-    user_style[user_id] = style
-    
-    welcome_text = (
-        "🌟 Привет! Я генерирую крутые картинки через нейросеть GigaChat.\n\n"
-        f"🎁 **У тебя есть {free_left} бесплатных генераций!**\n\n"
-        "📌 **Что умею:**\n"
-        "• 🎨 8 стилей генерации\n"
-        "• 🎲 Случайный промт\n"
-        "• 🔥 Популярные запросы\n"
-        "• ❤️ Избранное\n"
-        "• 📦 Ежедневный бонус\n"
-        "• 🔍 Поиск по истории /search\n"
-        "• 📦 Экспорт в ZIP /export\n\n"
-        "👇 Выбери действие в меню!"
-    )
-    
-    await message.answer(welcome_text, reply_markup=main_menu_keyboard())
+# ==================== АНИМАЦИЯ ЗАГРУЗКИ ====================
+async def show_loading_animation(message: Message, duration: int = 30):
+    """Показывает анимацию загрузки с точками"""
+    loading_message = await message.answer("🎨 Генерирую изображение")
+    dots = 0
+    for i in range(duration):
+        dots = (i % 3) + 1
+        try:
+            await loading_message.edit_text(f"🎨 Генерирую изображение{'.' * dots}")
+        except:
+            pass
+        await asyncio.sleep(1)
+    return loading_message
 
+# ==================== CALLBACK ОБРАБОТЧИКИ ====================
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery):
-    await callback.message.edit_text("📋 Главное меню:", reply_markup=main_menu_keyboard())
+    try:
+        await callback.message.edit_text("📋 Главное меню:", reply_markup=main_menu_keyboard())
+    except Exception:
+        await callback.message.answer("📋 Главное меню:", reply_markup=main_menu_keyboard())
     await callback.answer()
 
 @router.callback_query(F.data == "show_styles")
 async def show_styles(callback: CallbackQuery):
-    await callback.message.edit_text("🎨 Выбери стиль:", reply_markup=style_keyboard())
+    try:
+        await callback.message.edit_text("🎨 Выбери стиль:", reply_markup=style_keyboard())
+    except Exception:
+        await callback.message.answer("🎨 Выбери стиль:", reply_markup=style_keyboard())
     await callback.answer()
 
 @router.callback_query(F.data == "show_status")
@@ -593,7 +583,10 @@ async def random_prompt_callback(callback: CallbackQuery):
 
 @router.callback_query(F.data == "show_popular")
 async def show_popular(callback: CallbackQuery):
-    await callback.message.edit_text("🔥 Популярные промты:", reply_markup=popular_prompts_keyboard())
+    try:
+        await callback.message.edit_text("🔥 Популярные промты:", reply_markup=popular_prompts_keyboard())
+    except Exception:
+        await callback.message.answer("🔥 Популярные промты:", reply_markup=popular_prompts_keyboard())
     await callback.answer()
 
 @router.callback_query(F.data == "show_favorites")
@@ -649,12 +642,12 @@ async def choose_style(callback: CallbackQuery):
         "none": "✨ Без стиля"
     }
     
-    await callback.message.edit_text(
-        f"✅ Стиль выбран: {style_names.get(style, 'Без стиля')}\n\n"
-        "Теперь отправь мне текстовое описание картинки!\n\n"
-        "🎲 Или используй кнопки меню для случайного/популярного промта.",
-        reply_markup=main_menu_keyboard()
-    )
+    text = f"✅ Стиль выбран: {style_names.get(style, 'Без стиля')}\n\nТеперь отправь мне текстовое описание картинки!\n\n🎲 Или используй кнопки меню для случайного/популярного промта."
+    
+    try:
+        await callback.message.edit_text(text, reply_markup=main_menu_keyboard())
+    except Exception:
+        await callback.message.answer(text, reply_markup=main_menu_keyboard())
     await callback.answer()
 
 @router.callback_query(F.data.startswith("reg|"))
@@ -698,6 +691,32 @@ async def add_to_favorites_callback(callback: CallbackQuery):
     else:
         await callback.answer("⚠️ Уже в избранном!")
 
+# ==================== ОСНОВНЫЕ ОБРАБОТЧИКИ ====================
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+    update_activity(user_id)
+    
+    free_left = get_free_generations(user_id)
+    style = get_user_style(user_id)
+    user_style[user_id] = style
+    
+    welcome_text = (
+        "🌟 Привет! Я генерирую крутые картинки через нейросеть GigaChat.\n\n"
+        f"🎁 **У тебя есть {free_left} бесплатных генераций!**\n\n"
+        "📌 **Что умею:**\n"
+        "• 🎨 9 стилей генерации\n"
+        "• 🎲 Случайный промт\n"
+        "• 🔥 Популярные запросы\n"
+        "• ❤️ Избранное\n"
+        "• 📦 Ежедневный бонус\n"
+        "• 🔍 Поиск по истории /search\n"
+        "• 📦 Экспорт в ZIP /export\n\n"
+        "👇 Выбери действие в меню!"
+    )
+    
+    await message.answer(welcome_text, reply_markup=main_menu_keyboard())
+
 @router.message(F.text)
 async def handle_prompt(message: Message):
     user_id = message.from_user.id
@@ -731,7 +750,7 @@ async def handle_prompt(message: Message):
         )
 
 async def generate_and_send(message: Message, user_id: int, prompt: str, is_free: bool = False):
-    """Общая функция генерации и отправки"""
+    """Общая функция генерации и отправки с анимацией загрузки"""
     style = user_style.get(user_id, get_user_style(user_id))
     
     style_prompts_dict = style_prompts()
@@ -750,7 +769,8 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
         await message.answer(f"⏳ Дневной лимит ({DAILY_LIMIT}) исчерпан.\nПриходи завтра!")
         return
     
-    await message.answer("🎨 Генерирую изображение... (20–40 секунд)")
+    # Запускаем анимацию загрузки
+    loading_task = asyncio.create_task(show_loading_animation(message))
     
     try:
         image_bytes = await generate_gigachat_image(full_prompt)
@@ -758,6 +778,9 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
         logging.error(f"Generation exception: {e}")
         await message.answer("⚠️ Ошибка при генерации. Попробуй более простой промт.")
         return
+    finally:
+        # Останавливаем анимацию
+        loading_task.cancel()
     
     if image_bytes:
         if is_free:
@@ -861,27 +884,23 @@ async def cmd_export(message: Message):
     
     await message.answer("📦 Создаю архив... Это может занять несколько секунд.")
     
-    # Создаём ZIP архив в памяти
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         for idx, (img_id, prompt, url) in enumerate(history):
-            # Скачиваем изображение
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url) as resp:
                         if resp.status == 200:
                             image_bytes = await resp.read()
-                            # Очищаем имя файла
                             safe_prompt = "".join(c for c in prompt[:30] if c.isalnum() or c in " _-").strip()
                             filename = f"{idx+1:03d}_{safe_prompt}.jpg"
                             zip_file.writestr(filename, image_bytes)
-                await asyncio.sleep(0.1)  # Не перегружаем
+                await asyncio.sleep(0.1)
             except Exception as e:
                 logging.error(f"Export error for {img_id}: {e}")
     
     zip_buffer.seek(0)
     
-    # Отправляем архив
     await message.answer_document(
         document=BufferedInputFile(zip_buffer.getvalue(), filename=f"generations_{user_id}.zip"),
         caption=f"📦 Экспорт {len(history)} картинок"
