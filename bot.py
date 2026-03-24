@@ -2,8 +2,11 @@ import asyncio
 import json
 import logging
 import sqlite3
+import uuid
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
+from io import BytesIO
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
@@ -23,8 +26,17 @@ logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+# GigaChat credentials
+GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")
+GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+
+# Кеш для токена GigaChat
+_gigachat_token_cache = {
+    "token": None,
+    "expires_at": None
+}
 
 PRICES = {1: 30, 7: 150, 30: 500}
 
@@ -252,59 +264,121 @@ def main_menu_keyboard():
     builder.adjust(2)
     return builder.as_markup()
 
-# ========================= ГЕНЕРАЦИЯ =========================
-async def generate_flux(prompt: str, style: str = "none") -> str | None:
-    style_prompts = {
-        "photo": ", photorealistic, ultra detailed, 8k, cinematic lighting, sharp focus",
-        "anime": ", anime style, vibrant colors, detailed eyes, studio ghibli influence",
-        "cyber": ", cyberpunk, neon lights, futuristic city, blade runner aesthetic",
-        "candy": ", glossy candy-colored 3D, vibrant, oversaturated, 70s kodachrome film",
-        "none": ""
-    }
+# ========================= GIGACHAT API =========================
+async def get_gigachat_token() -> str | None:
+    """Получает access token для GigaChat API с кешированием на 25 минут"""
+    global _gigachat_token_cache
     
-    full_prompt = prompt.strip() + style_prompts.get(style, "")
+    now = datetime.now()
     
-    url = "https://api.replicate.com/v1/predictions"
+    # Если токен есть и не истёк (оставим запас 5 минут)
+    if (_gigachat_token_cache["token"] and 
+        _gigachat_token_cache["expires_at"] and 
+        now < _gigachat_token_cache["expires_at"]):
+        return _gigachat_token_cache["token"]
+    
+    url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    
     headers = {
-        "Authorization": f"Token {REPLICATE_API_TOKEN}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {GIGACHAT_CREDENTIALS}",
+        "RqUID": str(uuid.uuid4()),
+        "Content-Type": "application/x-www-form-urlencoded"
     }
     
-    payload = {
-        "version": "black-forest-labs/flux-schnell",
-        "input": {
-            "prompt": full_prompt,
-            "go_fast": True,
-            "aspect_ratio": "1:1",
-            "output_format": "webp",
-            "safety_tolerance": 2
-        }
+    data = {
+        "scope": GIGACHAT_SCOPE
     }
     
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload, headers=headers) as resp:
-            if resp.status != 201:
+        async with session.post(url, headers=headers, data=data, ssl=False) as resp:
+            if resp.status != 200:
                 text = await resp.text()
-                logging.error(f"Replicate error {resp.status}: {text}")
+                logging.error(f"GigaChat token error: {text}")
                 return None
             data = await resp.json()
-            prediction_id = data["id"]
+            token = data.get("access_token")
+            expires_in = data.get("expires_at", 1800)  # обычно 1800 секунд (30 мин)
+            
+            # Кешируем на 25 минут (оставляем запас 5 минут)
+            _gigachat_token_cache["token"] = token
+            _gigachat_token_cache["expires_at"] = now + timedelta(seconds=expires_in - 300)
+            
+            logging.info(f"GigaChat token obtained, expires at {_gigachat_token_cache['expires_at']}")
+            return token
+
+async def generate_gigachat_image(prompt: str) -> bytes | None:
+    """Генерирует изображение через GigaChat API и возвращает bytes"""
+    token = await get_gigachat_token()
+    if not token:
+        return None
+    
+    # Шаг 1: отправляем запрос на генерацию
+    url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+    
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    payload = {
+        "model": "GigaChat",
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "function_call": "auto"
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, headers=headers, ssl=False) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logging.error(f"GigaChat generation error {resp.status}: {text}")
+                return None
+            data = await resp.json()
+            
+            # Извлекаем идентификатор изображения из ответа
+            message_content = data["choices"][0]["message"]["content"]
+            logging.info(f"GigaChat response: {message_content[:200]}")
+            
+            match = re.search(r'<img src="([a-f0-9-]+)"', message_content)
+            if not match:
+                match = re.search(r'uuid:([a-f0-9-]+)', message_content)
+            if not match:
+                logging.error("No image UUID in response")
+                return None
+            file_id = match.group(1)
+            logging.info(f"Image UUID: {file_id}")
         
-        for _ in range(30):
+        # Шаг 2: скачиваем изображение
+        download_url = f"https://gigachat.devices.sberbank.ru/api/v1/files/{file_id}/content"
+        headers_download = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "image/jpeg"
+        }
+        
+        await asyncio.sleep(2)
+        
+        for attempt in range(5):
+            async with session.get(download_url, headers=headers_download, ssl=False) as resp:
+                if resp.status == 200:
+                    image_bytes = await resp.read()
+                    if image_bytes and len(image_bytes) > 1000:
+                        return image_bytes
+                    logging.warning(f"Download attempt {attempt+1}: empty image")
+                elif resp.status == 404:
+                    logging.info(f"Image not ready yet (attempt {attempt+1}/5)")
+                else:
+                    text = await resp.text()
+                    logging.error(f"Download error {resp.status}: {text}")
+            
             await asyncio.sleep(2)
-            async with session.get(f"{url}/{prediction_id}", headers=headers) as r:
-                if r.status != 200:
-                    continue
-                status = await r.json()
-                if status["status"] == "succeeded":
-                    output = status.get("output")
-                    if output and isinstance(output, list) and len(output) > 0:
-                        return output[0]
-                    return None
-                if status["status"] == "failed":
-                    logging.error("Flux generation failed")
-                    return None
-    return None
+        
+        logging.error("Failed to download image after 5 attempts")
+        return None
 
 # ========================= БОТ =========================
 session = AiohttpSession()
@@ -380,7 +454,7 @@ async def send_reminders():
                             user_id,
                             f"👋 **Давно не виделись!**\n\n"
                             f"У тебя осталось **{free_left}** бесплатных генераций.\n"
-                            "Попробуй снова — нейросеть Flux Schnell делает отличные картинки!\n\n"
+                            "Попробуй снова — нейросеть GigaChat делает отличные картинки!\n\n"
                             "Просто выбери стиль и отправь промт."
                         )
                     mark_reminder_sent(user_id, "inactive")
@@ -401,7 +475,7 @@ async def cmd_start(message: Message):
     free_left = get_free_generations(user_id)
     
     welcome_text = (
-        "🌟 Привет! Я генерирую крутые картинки через нейросеть Flux Schnell.\n\n"
+        "🌟 Привет! Я генерирую крутые картинки через нейросеть GigaChat.\n\n"
         f"🎁 **У тебя есть {FREE_GENERATIONS} бесплатных генераций!**\n\n"
         "1️⃣ Выбери стиль\n"
         "2️⃣ Отправь текстовое описание\n"
@@ -459,7 +533,7 @@ async def process_sub(callback: CallbackQuery):
     
     await bot.send_invoice(
         chat_id=callback.from_user.id,
-        title=f"Подписка Flux — {days} дней",
+        title=f"Подписка GigaChat — {days} дней",
         description=f"Неограниченная генерация на {days} дней",
         payload=f"sub_{days}",
         provider_token="",
@@ -507,8 +581,21 @@ async def handle_prompt(message: Message):
         )
 
 async def generate_and_send(message: Message, user_id: int, prompt: str, is_free: bool = False):
-    """Общая функция генерации и отправки"""
+    """Общая функция генерации и отправки (GigaChat)"""
     style = user_style.get(user_id, "none")
+    
+    # Добавляем стиль к промту
+    style_prompts = {
+        "photo": "в фотореалистичном стиле, высокая детализация, 8k",
+        "anime": "в стиле аниме, яркие цвета, детализированные глаза",
+        "cyber": "в стиле киберпанк, неоновые огни, футуристический город",
+        "candy": "в глянцевом 3D-стиле, яркие насыщенные цвета, конфетные оттенки",
+        "none": ""
+    }
+    
+    full_prompt = prompt.strip()
+    if style != "none":
+        full_prompt += f", {style_prompts.get(style, '')}"
     
     if not is_free:
         daily_count = get_daily_generations(user_id)
@@ -516,22 +603,25 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
             await message.answer(f"⏳ Сегодняшний лимит ({DAILY_LIMIT}) исчерпан.\nПриходи завтра!")
             return
     
-    await message.answer("🎨 Генерирую изображение... (10–20 секунд)")
+    await message.answer("🎨 Генерирую изображение через GigaChat... (15–30 секунд)")
     
-    image_url = await generate_flux(prompt, style)
+    image_bytes = await generate_gigachat_image(full_prompt)
     
-    if image_url:
+    if image_bytes:
         if is_free:
-            remaining = use_free_generation(user_id)
+            use_free_generation(user_id)
             free_text = f"\n🎁 Бесплатных осталось: {get_free_generations(user_id)}"
         else:
             free_text = ""
         
+        photo_file = BytesIO(image_bytes)
+        photo_file.name = "image.jpg"
+        
         await message.answer_photo(
-            photo=image_url,
-            caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:80]}...{free_text}"
+            photo=photo_file,
+            caption=f"✨ Готово! (GigaChat)\nСтиль: {style}\nПромт: {prompt[:80]}...{free_text}"
         )
-        save_to_history(user_id, prompt, image_url)
+        save_to_history(user_id, prompt, "gigachat_generated")
     else:
         await message.answer("⚠️ Ошибка генерации. Попробуй другой промт или повтори позже.")
 
@@ -725,12 +815,9 @@ async def main():
     # Запускаем напоминания
     asyncio.create_task(send_reminders())
     
-    logging.info("🚀 Бот Flux Schnell запущен! Бесплатные генерации активны.")
+    logging.info("🚀 Бот GigaChat запущен! Бесплатные генерации активны.")
     
     await dp.start_polling(bot, skip_updates=True)
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 if __name__ == "__main__":
     asyncio.run(main())
