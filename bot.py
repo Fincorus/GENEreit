@@ -13,7 +13,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    LabeledPrice, Message, PreCheckoutQuery, BufferedInputFile
+    Message, BufferedInputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
@@ -37,15 +37,9 @@ _gigachat_token_cache = {
     "expires_at": None
 }
 
-PRICES = {1: 30, 7: 150, 30: 500}
-
-CONFIG_FILE = "config.json"
-if Path(CONFIG_FILE).exists():
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        PRICES = json.load(f)
-
-DAILY_LIMIT = 50
-FREE_GENERATIONS = 5
+# Лимиты (можно убрать или оставить для теста)
+DAILY_LIMIT = 100  # Безлимит, но ограничим 100 в день чтобы не перегружать API
+FREE_GENERATIONS = 10  # Бесплатных генераций (можно убрать, но оставим как тест)
 
 DB_FILE = "bot.db"
 
@@ -56,8 +50,7 @@ def init_db():
     
     cur.execute("""CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        subscription_end TIMESTAMP
+        username TEXT
     )""")
     
     cur.execute("""CREATE TABLE IF NOT EXISTS history (
@@ -70,14 +63,12 @@ def init_db():
     
     cur.execute("""CREATE TABLE IF NOT EXISTS free_generations (
         user_id INTEGER PRIMARY KEY,
-        remaining INTEGER DEFAULT 5
+        remaining INTEGER DEFAULT 10
     )""")
     
     cur.execute("""CREATE TABLE IF NOT EXISTS user_activity (
         user_id INTEGER PRIMARY KEY,
-        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_reminder_sent TIMESTAMP,
-        reminder_type TEXT
+        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
     
     conn.commit()
@@ -87,64 +78,9 @@ def update_activity(user_id: int):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("""
-        INSERT OR REPLACE INTO user_activity (user_id, last_active, last_reminder_sent, reminder_type)
-        VALUES (?, CURRENT_TIMESTAMP, ?, ?)
-    """, (user_id, None, None))
-    conn.commit()
-    conn.close()
-
-def get_inactive_users(days: int = 7) -> list:
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    threshold = (datetime.now() - timedelta(days=days)).isoformat()
-    cur.execute("""
-        SELECT ua.user_id 
-        FROM user_activity ua
-        WHERE ua.last_active < ?
-        AND (ua.last_reminder_sent IS NULL OR ua.last_reminder_sent < ?)
-    """, (threshold, (datetime.now() - timedelta(days=1)).isoformat()))
-    users = [row[0] for row in cur.fetchall()]
-    conn.close()
-    return users
-
-def get_users_with_expiring_subscription(days_left: int = 1) -> list:
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    now = datetime.now()
-    end_threshold = now + timedelta(days=days_left)
-    cur.execute("""
-        SELECT user_id 
-        FROM users 
-        WHERE subscription_end > ? AND subscription_end <= ?
-    """, (now.isoformat(), end_threshold.isoformat()))
-    users = [row[0] for row in cur.fetchall()]
-    conn.close()
-    return users
-
-def get_users_without_subscription_and_free() -> list:
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    now = datetime.now()
-    cur.execute("""
-        SELECT u.user_id 
-        FROM users u
-        LEFT JOIN free_generations f ON u.user_id = f.user_id
-        WHERE (u.subscription_end IS NULL OR u.subscription_end < ?)
-        AND (f.remaining IS NULL OR f.remaining = 0)
-        AND (SELECT last_reminder_sent FROM user_activity WHERE user_id = u.user_id) IS NULL
-    """, (now.isoformat(),))
-    users = [row[0] for row in cur.fetchall()]
-    conn.close()
-    return users
-
-def mark_reminder_sent(user_id: int, reminder_type: str):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE user_activity 
-        SET last_reminder_sent = CURRENT_TIMESTAMP, reminder_type = ?
-        WHERE user_id = ?
-    """, (reminder_type, user_id))
+        INSERT OR REPLACE INTO user_activity (user_id, last_active)
+        VALUES (?, CURRENT_TIMESTAMP)
+    """, (user_id,))
     conn.commit()
     conn.close()
 
@@ -185,29 +121,6 @@ def reset_free_generations(user_id: int):
     conn.commit()
     conn.close()
 
-def get_user(user_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return datetime.fromisoformat(row[0]) if row and row[0] else None
-
-def update_subscription(user_id: int, days: int):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    now = datetime.now()
-    end = get_user(user_id) or now
-    new_end = max(end, now) + timedelta(days=days)
-    cur.execute("INSERT OR REPLACE INTO users (user_id, username, subscription_end) VALUES (?, ?, ?)",
-                (user_id, None, new_end.isoformat()))
-    conn.commit()
-    conn.close()
-
-def has_active_subscription(user_id: int) -> bool:
-    end = get_user(user_id)
-    return end is not None and end > datetime.now()
-
 def get_daily_generations(user_id: int) -> int:
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -233,13 +146,6 @@ def get_history(user_id: int, limit=5):
     return rows
 
 # ========================= КНОПКИ =========================
-def subscribe_keyboard():
-    builder = InlineKeyboardBuilder()
-    for days, stars in PRICES.items():
-        builder.button(text=f"{days} дн. — {stars} Stars", callback_data=f"sub_{days}")
-    builder.adjust(1)
-    return builder.as_markup()
-
 def style_keyboard():
     builder = InlineKeyboardBuilder()
     styles = [
@@ -257,29 +163,20 @@ def style_keyboard():
 def main_menu_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="🎨 Выбрать стиль", callback_data="show_styles")
-    builder.button(text="💎 Купить подписку", callback_data="buy_sub")
-    builder.button(text="📊 Статус", callback_data="show_status")
     builder.button(text="🎁 Бесплатные", callback_data="show_free")
+    builder.button(text="📊 Статус", callback_data="show_status")
     builder.adjust(2)
     return builder.as_markup()
 
-def after_generation_keyboard(prompt: str, style: str, is_free: bool = False):
+def after_generation_keyboard(prompt: str, style: str):
     """Клавиатура, которая появляется после генерации"""
     builder = InlineKeyboardBuilder()
     
-    # Кнопка для повторной генерации с тем же промтом (обрезаем для callback_data)
-    short_prompt = prompt[:50].replace("|", " ").replace("\n", " ")
-    builder.button(text="🔄 Сгенерировать ещё", callback_data=f"regenerate|{short_prompt}|{style}")
+    short_prompt = prompt[:40].replace("|", " ").replace("\n", " ").strip()
     
-    # Кнопка выбора стиля
+    builder.button(text="🔄 Сгенерировать ещё", callback_data=f"reg|{short_prompt}|{style}")
     builder.button(text="🎨 Выбрать стиль", callback_data="show_styles")
-    
-    # Кнопка статуса
     builder.button(text="📊 Статус", callback_data="show_status")
-    
-    # Если бесплатная генерация, показываем кнопку подписки
-    if is_free:
-        builder.button(text="💎 Купить подписку", callback_data="buy_sub")
     
     builder.adjust(1)
     return builder.as_markup()
@@ -322,12 +219,11 @@ async def get_gigachat_token() -> str | None:
             expires_at = data.get("expires_at")
             
             if expires_at:
-                # Определяем формат по количеству цифр
-                if expires_at > 1_000_000_000_000:  # 13+ цифр — миллисекунды
+                if expires_at > 1_000_000_000_000:
                     expires_dt = datetime.fromtimestamp(expires_at / 1000)
-                elif expires_at > 1_000_000_000:     # 10 цифр — секунды
+                elif expires_at > 1_000_000_000:
                     expires_dt = datetime.fromtimestamp(expires_at)
-                else:                                 # меньше — количество секунд до истечения
+                else:
                     expires_dt = now + timedelta(seconds=expires_at - 300)
             else:
                 expires_dt = now + timedelta(minutes=25)
@@ -344,6 +240,11 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
     if not token:
         return None
     
+    # Ограничиваем длину промта
+    if len(prompt) > 500:
+        prompt = prompt[:500]
+        logging.warning(f"Prompt truncated to 500 chars")
+    
     url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
     
     headers = {
@@ -352,8 +253,7 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
         "Accept": "application/json"
     }
     
-    # Явно указываем, что нужно сгенерировать изображение
-    full_prompt = f"Создай изображение: {prompt}"
+    full_prompt = f"Нарисуй фотореалистичное изображение: {prompt}"
     
     payload = {
         "model": "GigaChat",
@@ -375,9 +275,13 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
             data = await resp.json()
             
             message_content = data["choices"][0]["message"]["content"]
-            logging.info(f"GigaChat response: {message_content[:500]}")
+            logging.info(f"GigaChat response: {message_content[:300]}")
             
-            # Ищем UUID изображения
+            # Проверяем отказ
+            if "не получилось" in message_content.lower() or "не удалось" in message_content.lower():
+                logging.error("GigaChat refused to generate")
+                return None
+            
             match = re.search(r'<img src="([a-f0-9-]+)"', message_content)
             if not match:
                 match = re.search(r'uuid:([a-f0-9-]+)', message_content)
@@ -385,7 +289,6 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
                 match = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', message_content)
             if not match:
                 logging.error("No image UUID in response")
-                logging.error(f"Full response: {message_content}")
                 return None
             file_id = match.group(1)
             logging.info(f"Image UUID: {file_id}")
@@ -425,97 +328,21 @@ dp.include_router(router)
 
 user_style = {}
 
-# ==================== ФОНОВЫЕ НАПОМИНАНИЯ ====================
-async def send_reminders():
-    """Фоновая задача: раз в день отправляет напоминания"""
-    while True:
-        try:
-            now = datetime.now()
-            next_run = now.replace(hour=12, minute=0, second=0, microsecond=0)
-            if now >= next_run:
-                next_run += timedelta(days=1)
-            wait_seconds = (next_run - now).total_seconds()
-            await asyncio.sleep(wait_seconds)
-            
-            expiring_users = get_users_with_expiring_subscription(days_left=1)
-            for user_id in expiring_users:
-                try:
-                    await bot.send_message(
-                        user_id,
-                        "⏰ **Подписка заканчивается завтра!**\n\n"
-                        "Твоя безлимитная генерация скоро закончится.\n"
-                        "Продли подписку сейчас — всего 30 Stars за 1 день!\n\n"
-                        "Нажми /subscribe чтобы выбрать тариф.",
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                            InlineKeyboardButton(text="💎 Продлить подписку", callback_data="buy_sub")
-                        ]])
-                    )
-                    mark_reminder_sent(user_id, "expiring")
-                    await asyncio.sleep(0.1)
-                except Exception as e:
-                    logging.error(f"Ошибка отправки напоминания {user_id}: {e}")
-            
-            free_exhausted_users = get_users_without_subscription_and_free()
-            for user_id in free_exhausted_users:
-                try:
-                    await bot.send_message(
-                        user_id,
-                        "🎁 **Твои бесплатные генерации закончились!**\n\n"
-                        "Но ты всё ещё можешь пользоваться ботом — подписка стоит всего 30 Stars.\n"
-                        "Это меньше чашки кофе, а генераций — безлимит!\n\n"
-                        "👉 /subscribe чтобы начать генерировать снова",
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                            InlineKeyboardButton(text="💎 Купить подписку", callback_data="buy_sub")
-                        ]])
-                    )
-                    mark_reminder_sent(user_id, "free_exhausted")
-                    await asyncio.sleep(0.1)
-                except Exception as e:
-                    logging.error(f"Ошибка отправки напоминания {user_id}: {e}")
-            
-            inactive_users = get_inactive_users(days=7)
-            for user_id in inactive_users:
-                try:
-                    if has_active_subscription(user_id):
-                        await bot.send_message(
-                            user_id,
-                            "👋 **Давно не виделись!**\n\n"
-                            "Твоя подписка активна, а ты не пользуешься ботом.\n"
-                            "Попробуй сгенерировать что-нибудь новое — нейросети постоянно улучшаются!\n\n"
-                            "Просто отправь любой промт :)"
-                        )
-                    else:
-                        free_left = get_free_generations(user_id)
-                        await bot.send_message(
-                            user_id,
-                            f"👋 **Давно не виделись!**\n\n"
-                            f"У тебя осталось **{free_left}** бесплатных генераций.\n"
-                            "Попробуй снова — нейросеть GigaChat делает отличные картинки!\n\n"
-                            "Просто выбери стиль и отправь промт."
-                        )
-                    mark_reminder_sent(user_id, "inactive")
-                    await asyncio.sleep(0.1)
-                except Exception as e:
-                    logging.error(f"Ошибка отправки напоминания {user_id}: {e}")
-                    
-        except Exception as e:
-            logging.error(f"Ошибка в фоновой задаче: {e}")
-            await asyncio.sleep(3600)
-
 # ==================== ОБРАБОТЧИКИ ====================
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     user_id = message.from_user.id
     update_activity(user_id)
     
+    free_left = get_free_generations(user_id)
+    
     welcome_text = (
         "🌟 Привет! Я генерирую крутые картинки через нейросеть GigaChat.\n\n"
-        f"🎁 **У тебя есть {FREE_GENERATIONS} бесплатных генераций!**\n\n"
+        f"🎁 **У тебя есть {free_left} бесплатных генераций!**\n\n"
         "1️⃣ Выбери стиль\n"
         "2️⃣ Отправь текстовое описание\n"
         "3️⃣ Получи картинку\n\n"
-        "💎 После бесплатных можно купить подписку — всего 30 Stars за 1 день.\n"
-        "🚀 Безлимитная генерация для подписчиков!"
+        "✨ После бесплатных можно запросить бонус у администратора."
     )
     
     await message.answer(welcome_text, reply_markup=main_menu_keyboard())
@@ -523,11 +350,6 @@ async def cmd_start(message: Message):
 @router.callback_query(F.data == "show_styles")
 async def show_styles(callback: CallbackQuery):
     await callback.message.answer("🎨 Выбери стиль:", reply_markup=style_keyboard())
-    await callback.answer()
-
-@router.callback_query(F.data == "buy_sub")
-async def buy_sub(callback: CallbackQuery):
-    await callback.message.answer("💎 Выбери длительность подписки:", reply_markup=subscribe_keyboard())
     await callback.answer()
 
 @router.callback_query(F.data == "show_status")
@@ -538,7 +360,7 @@ async def show_status_callback(callback: CallbackQuery):
 @router.callback_query(F.data == "show_free")
 async def show_free_callback(callback: CallbackQuery):
     free_left = get_free_generations(callback.from_user.id)
-    await callback.message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.\n\nПосле этого для генерации нужна подписка.")
+    await callback.message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.")
     await callback.answer()
 
 @router.callback_query(F.data.startswith("style_"))
@@ -560,66 +382,35 @@ async def choose_style(callback: CallbackQuery):
     )
     await callback.answer()
 
-@router.callback_query(F.data.startswith("sub_"))
-async def process_sub(callback: CallbackQuery):
-    days = int(callback.data.split("_")[1])
-    stars = PRICES.get(days, 30)
-    
-    await bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title=f"Подписка GigaChat — {days} дней",
-        description=f"Неограниченная генерация на {days} дней",
-        payload=f"sub_{days}",
-        provider_token="",
-        currency="XTR",
-        prices=[LabeledPrice(label=f"{days} дней", amount=stars)]
-    )
-    await callback.answer()
-
-@router.pre_checkout_query()
-async def pre_checkout(pre: PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(pre.id, ok=True)
-
-@router.message(F.successful_payment)
-async def successful_payment(message: Message):
-    days = int(message.successful_payment.invoice_payload.split("_")[1])
-    update_subscription(message.from_user.id, days)
-    await message.answer(f"✅ Подписка активирована на {days} дней!\nТеперь ты можешь генерировать безлимитно (до {DAILY_LIMIT} в день).")
-
-# ==================== ОБРАБОТЧИК РЕГЕНЕРАЦИИ ====================
-@router.callback_query(F.data.startswith("regenerate|"))
+@router.callback_query(F.data.startswith("reg|"))
 async def regenerate_image(callback: CallbackQuery):
     """Обработчик кнопки 'Сгенерировать ещё'"""
     user_id = callback.from_user.id
     update_activity(user_id)
     
-    # Извлекаем промт и стиль из callback_data
     data = callback.data.split("|")
     if len(data) >= 3:
         prompt = data[1]
         style = data[2]
-        # Сохраняем стиль для пользователя
         user_style[user_id] = style
+    else:
+        await callback.answer("❌ Ошибка: не удалось восстановить промт")
+        return
     
     await callback.answer("🔄 Генерирую снова...")
     
-    # Проверяем подписку или бесплатные
-    if has_active_subscription(user_id):
-        await generate_and_send(callback.message, user_id, prompt)
+    free_left = get_free_generations(user_id)
+    if free_left > 0:
+        await generate_and_send(callback.message, user_id, prompt, is_free=True)
     else:
-        free_left = get_free_generations(user_id)
-        if free_left > 0:
-            await generate_and_send(callback.message, user_id, prompt, is_free=True)
-        else:
-            await callback.message.answer(
-                "❌ У тебя закончились бесплатные генерации.\n\n"
-                "Купи подписку, чтобы продолжать генерировать!",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="💎 Купить подписку", callback_data="buy_sub")
-                ]])
-            )
+        await callback.message.answer(
+            "❌ У тебя закончились бесплатные генерации.\n\n"
+            "Напиши администратору, чтобы получить бонус.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📊 Статус", callback_data="show_status")
+            ]])
+        )
 
-# ==================== ОБРАБОТЧИК ТЕКСТА ====================
 @router.message(F.text)
 async def handle_prompt(message: Message):
     user_id = message.from_user.id
@@ -627,12 +418,7 @@ async def handle_prompt(message: Message):
     
     prompt = message.text.strip()
     
-    # Если это команда — пропускаем
     if prompt.startswith('/'):
-        return
-    
-    if has_active_subscription(user_id):
-        await generate_and_send(message, user_id, prompt)
         return
     
     free_left = get_free_generations(user_id)
@@ -642,39 +428,45 @@ async def handle_prompt(message: Message):
     else:
         await message.answer(
             "❌ У тебя закончились бесплатные генерации.\n\n"
-            f"💰 **Купи подписку всего за 30 Stars на 1 день** и генерируй безлимитно!\n\n"
-            "Нажми /subscribe чтобы выбрать тариф.",
+            "Напиши администратору, чтобы получить бонус.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="💎 Купить подписку", callback_data="buy_sub")
+                InlineKeyboardButton(text="📊 Статус", callback_data="show_status")
             ]])
         )
 
-# ==================== ФУНКЦИЯ ГЕНЕРАЦИИ И ОТПРАВКИ ====================
 async def generate_and_send(message: Message, user_id: int, prompt: str, is_free: bool = False):
-    """Общая функция генерации и отправки (GigaChat) с клавиатурой после генерации"""
+    """Общая функция генерации и отправки"""
     style = user_style.get(user_id, "none")
     
     style_prompts = {
-        "photo": "в фотореалистичном стиле, высокая детализация, 8k",
-        "anime": "в стиле аниме, яркие цвета, детализированные глаза",
-        "cyber": "в стиле киберпанк, неоновые огни, футуристический город",
-        "candy": "в глянцевом 3D-стиле, яркие насыщенные цвета, конфетные оттенки",
+        "photo": "фотореалистичный стиль, высокая детализация, профессиональная фотография",
+        "anime": "стиль аниме, яркие цвета, детализированные глаза",
+        "cyber": "киберпанк стиль, неоновые огни",
+        "candy": "глянцевый 3D стиль, яркие насыщенные цвета",
         "none": ""
     }
     
     full_prompt = prompt.strip()
     if style != "none":
-        full_prompt += f", {style_prompts.get(style, '')}"
+        full_prompt = f"{full_prompt}, {style_prompts.get(style, '')}"
     
-    if not is_free:
-        daily_count = get_daily_generations(user_id)
-        if daily_count >= DAILY_LIMIT:
-            await message.answer(f"⏳ Сегодняшний лимит ({DAILY_LIMIT}) исчерпан.\nПриходи завтра!")
-            return
+    if len(full_prompt) > 400:
+        full_prompt = full_prompt[:400]
+        await message.answer("⚠️ Промт слишком длинный, я немного сократил его.")
     
-    await message.answer("🎨 Генерирую изображение через GigaChat... (15–30 секунд)")
+    daily_count = get_daily_generations(user_id)
+    if daily_count >= DAILY_LIMIT:
+        await message.answer(f"⏳ Дневной лимит ({DAILY_LIMIT}) исчерпан.\nПриходи завтра!")
+        return
     
-    image_bytes = await generate_gigachat_image(full_prompt)
+    await message.answer("🎨 Генерирую изображение... (20–40 секунд)")
+    
+    try:
+        image_bytes = await generate_gigachat_image(full_prompt)
+    except Exception as e:
+        logging.error(f"Generation exception: {e}")
+        await message.answer("⚠️ Ошибка при генерации. Попробуй более простой промт.")
+        return
     
     if image_bytes:
         if is_free:
@@ -683,51 +475,40 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
         else:
             free_text = ""
         
-        # Отправляем изображение
         photo_file = BufferedInputFile(image_bytes, filename="image.jpg")
-        
-        # Формируем клавиатуру для после генерации
-        reply_markup = after_generation_keyboard(prompt, style, is_free)
+        reply_markup = after_generation_keyboard(prompt[:40], style)
         
         await message.answer_photo(
             photo=photo_file,
-            caption=f"✨ Готово! (GigaChat)\nСтиль: {style}\nПромт: {prompt[:80]}...{free_text}",
+            caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}",
             reply_markup=reply_markup
         )
         save_to_history(user_id, prompt, "gigachat_generated")
     else:
-        await message.answer("⚠️ Ошибка генерации. Попробуй другой промт или повтори позже.")
+        await message.answer(
+            "⚠️ Не удалось сгенерировать изображение.\n\n"
+            "Попробуй:\n"
+            "• Упростить промт (убрать технические детали)\n"
+            "• Сделать запрос короче\n"
+            "• Использовать английский язык\n\n"
+            "Пример: *фотореалистичный портрет девушки, зеленые глаза*"
+        )
 
-# ==================== ОСТАЛЬНЫЕ КОМАНДЫ ====================
-@router.message(Command("subscribe"))
-async def cmd_subscribe(message: Message):
-    await message.answer("💎 Выбери подписку:", reply_markup=subscribe_keyboard())
-
+# ==================== КОМАНДЫ ====================
 @router.message(Command("status"))
 async def cmd_status(message: Message):
     user_id = message.from_user.id
-    end = get_user(user_id)
     free_left = get_free_generations(user_id)
     style = user_style.get(user_id, "не выбран")
+    gens_today = get_daily_generations(user_id)
     
-    if end and end > datetime.now():
-        days_left = (end - datetime.now()).days
-        gens_today = get_daily_generations(user_id)
-        await message.answer(
-            f"📊 **Статус**\n\n"
-            f"💎 **Подписка:** активна до {end.strftime('%d.%m.%Y')} (осталось {days_left} дн.)\n"
-            f"🎨 **Стиль:** {style}\n"
-            f"🖼 **Сегодня:** {gens_today}/{DAILY_LIMIT} генераций\n"
-            f"🎁 **Бесплатных осталось:** {free_left}"
-        )
-    else:
-        await message.answer(
-            f"📊 **Статус**\n\n"
-            f"❌ Подписка неактивна\n"
-            f"🎨 **Стиль:** {style}\n"
-            f"🎁 **Бесплатных осталось:** {free_left}\n\n"
-            f"Купить подписку: /subscribe"
-        )
+    await message.answer(
+        f"📊 **Статус**\n\n"
+        f"🎨 **Стиль:** {style}\n"
+        f"🖼 **Сегодня:** {gens_today}/{DAILY_LIMIT} генераций\n"
+        f"🎁 **Бесплатных осталось:** {free_left}\n\n"
+        f"После бесплатных напиши администратору для бонуса."
+    )
 
 @router.message(Command("history"))
 async def cmd_history(message: Message):
@@ -742,7 +523,7 @@ async def cmd_history(message: Message):
 @router.message(Command("free"))
 async def cmd_free(message: Message):
     free_left = get_free_generations(message.from_user.id)
-    await message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.\n\nПосле этого для генерации нужна подписка.")
+    await message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.")
 
 # ==================== АДМИН-КОМАНДЫ ====================
 @router.message(Command("admin"))
@@ -753,9 +534,7 @@ async def cmd_admin(message: Message):
         "🛠 Админ-панель:\n"
         "/stats — статистика\n"
         "/broadcast [текст] — рассылка\n"
-        "/setprice [дни] [stars] — изменить цену\n"
-        "/gift [user_id] — добавить 5 бесплатных пользователю\n"
-        "/activity_stats — активность пользователей"
+        "/gift [user_id] — добавить 10 бесплатных пользователю"
     )
 
 @router.message(Command("stats"))
@@ -766,15 +545,12 @@ async def cmd_stats(message: Message):
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM users")
     total_users = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM users WHERE subscription_end > datetime('now')")
-    active_subs = cur.fetchone()[0]
     cur.execute("SELECT SUM(remaining) FROM free_generations")
     free_remaining = cur.fetchone()[0] or 0
     conn.close()
     await message.answer(
         f"📊 **Статистика**\n\n"
         f"👥 Всего пользователей: {total_users}\n"
-        f"💎 Активных подписок: {active_subs}\n"
         f"🎁 Всего бесплатных осталось: {free_remaining}"
     )
 
@@ -818,45 +594,6 @@ async def cmd_broadcast(message: Message):
             pass
     await message.answer(f"Рассылка отправлена {success} пользователям.")
 
-@router.message(Command("setprice"))
-async def cmd_setprice(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    parts = message.text.split()
-    if len(parts) != 3:
-        await message.answer("Формат: /setprice [дни] [stars]")
-        return
-    days = int(parts[1])
-    stars = int(parts[2])
-    PRICES[days] = stars
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(PRICES, f)
-    await message.answer(f"✅ Цена на {days} дней установлена: {stars} Stars")
-
-@router.message(Command("activity_stats"))
-async def cmd_activity_stats(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    
-    week_ago = (datetime.now() - timedelta(days=7)).isoformat()
-    cur.execute("SELECT COUNT(*) FROM user_activity WHERE last_active > ?", (week_ago,))
-    active_week = cur.fetchone()[0]
-    
-    cur.execute("SELECT COUNT(*) FROM users")
-    total_users = cur.fetchone()[0]
-    
-    conn.close()
-    
-    await message.answer(
-        f"📊 **Активность пользователей**\n\n"
-        f"👥 Всего пользователей: {total_users}\n"
-        f"🟢 Активны за 7 дней: {active_week}\n"
-        f"📈 Конверсия: {round(active_week / total_users * 100, 1) if total_users > 0 else 0}%"
-    )
-
 # ==================== HEALTH CHECK ДЛЯ RENDER ====================
 async def health_check_server():
     """Простой HTTP-сервер, чтобы Render не завершал процесс"""
@@ -884,9 +621,8 @@ async def main():
     init_db()
     
     asyncio.create_task(health_check_server())
-    asyncio.create_task(send_reminders())
     
-    logging.info("🚀 Бот GigaChat запущен! Бесплатные генерации активны.")
+    logging.info("🚀 Бот GigaChat запущен! Безлимитные генерации активны.")
     
     await dp.start_polling(bot, skip_updates=True)
 
