@@ -348,7 +348,8 @@ def main_menu_keyboard():
 def popular_prompts_keyboard():
     builder = InlineKeyboardBuilder()
     for name, prompt in POPULAR_PROMPTS.items():
-        builder.button(text=name, callback_data=f"use_prompt|{prompt}")
+        short_prompt = prompt[:30].replace("|", " ").replace("\n", " ")
+        builder.button(text=name, callback_data=f"prompt|{short_prompt}")
     builder.button(text="🔙 Назад", callback_data="back_to_menu")
     builder.adjust(1)
     return builder.as_markup()
@@ -531,181 +532,7 @@ async def show_loading_animation(message: Message, duration: int = 30):
         await asyncio.sleep(1)
     return loading_message
 
-# ==================== CALLBACK ОБРАБОТЧИКИ ====================
-@router.callback_query(F.data == "back_to_menu")
-async def back_to_menu(callback: CallbackQuery):
-    try:
-        await callback.message.edit_text("📋 Главное меню:", reply_markup=main_menu_keyboard())
-    except Exception:
-        await callback.message.answer("📋 Главное меню:", reply_markup=main_menu_keyboard())
-    await callback.answer()
-
-@router.callback_query(F.data == "show_styles")
-async def show_styles(callback: CallbackQuery):
-    try:
-        await callback.message.edit_text("🎨 Выбери стиль:", reply_markup=style_keyboard())
-    except Exception:
-        await callback.message.answer("🎨 Выбери стиль:", reply_markup=style_keyboard())
-    await callback.answer()
-
-@router.callback_query(F.data == "show_status")
-async def show_status_callback(callback: CallbackQuery):
-    await cmd_status(callback.message)
-    await callback.answer()
-
-@router.callback_query(F.data == "show_free")
-async def show_free_callback(callback: CallbackQuery):
-    free_left = get_free_generations(callback.from_user.id)
-    await callback.message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.")
-    await callback.answer()
-
-@router.callback_query(F.data == "daily_bonus")
-async def daily_bonus_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    
-    if can_claim_daily_bonus(user_id):
-        claim_daily_bonus(user_id)
-        free_left = get_free_generations(user_id)
-        await callback.message.answer(f"✅ Ты получил ежедневный бонус +{DAILY_BONUS} генераций!\n\n🎁 Теперь у тебя {free_left} бесплатных генераций.")
-    else:
-        await callback.message.answer("⏳ Ты уже получал бонус сегодня. Приходи завтра!")
-    
-    await callback.answer()
-
-@router.callback_query(F.data == "random_prompt")
-async def random_prompt_callback(callback: CallbackQuery):
-    prompt = random.choice(RANDOM_PROMPTS)
-    user_id = callback.from_user.id
-    
-    await callback.answer(f"🎲 Выбран промт: {prompt}")
-    
-    last_user_prompt[user_id] = prompt
-    
-    free_left = get_free_generations(user_id)
-    if free_left > 0:
-        await generate_and_send(callback.message, user_id, prompt, is_free=True)
-    else:
-        await callback.message.answer("❌ Бесплатные генерации закончились. Получи ежедневный бонус или напиши администратору.")
-
-@router.callback_query(F.data == "show_popular")
-async def show_popular(callback: CallbackQuery):
-    try:
-        await callback.message.edit_text("🔥 Популярные промты:", reply_markup=popular_prompts_keyboard())
-    except Exception:
-        await callback.message.answer("🔥 Популярные промты:", reply_markup=popular_prompts_keyboard())
-    await callback.answer()
-
-@router.callback_query(F.data == "show_favorites")
-async def show_favorites(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    favorites = get_favorites(user_id)
-    
-    if not favorites:
-        await callback.message.answer("❤️ У тебя пока нет избранных картинок. Чтобы добавить, нажми ❤️ В избранное после генерации.")
-        await callback.answer()
-        return
-    
-    await callback.message.answer(f"❤️ Твои избранные картинки ({len(favorites)}):")
-    
-    for img_id, prompt, file_id in favorites:
-        try:
-            await callback.message.answer_photo(
-                photo=file_id,
-                caption=f"📝 {prompt[:60]}\n🆔 ID: {img_id}\n❤️ В избранном"
-            )
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            logging.error(f"Error showing favorite {img_id}: {e}")
-            # Если file_id не работает, пробуем удалить из избранного
-            remove_from_favorites(user_id, img_id)
-            await callback.message.answer(f"⚠️ Картинка {img_id} недоступна, удалена из избранного.")
-    
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("use_prompt|"))
-async def use_prompt(callback: CallbackQuery):
-    prompt = callback.data.split("|")[1]
-    user_id = callback.from_user.id
-    
-    await callback.answer(f"✅ Выбран промт: {prompt[:50]}...")
-    
-    last_user_prompt[user_id] = prompt
-    
-    free_left = get_free_generations(user_id)
-    if free_left > 0:
-        await generate_and_send(callback.message, user_id, prompt, is_free=True)
-    else:
-        await callback.message.answer("❌ Бесплатные генерации закончились. Получи ежедневный бонус или напиши администратору.")
-
-@router.callback_query(F.data.startswith("style_"))
-async def choose_style(callback: CallbackQuery):
-    style = callback.data.split("_")[1]
-    user_id = callback.from_user.id
-    user_style[user_id] = style
-    save_user_style(user_id, style)
-    
-    style_names = {
-        "photo": "📸 Фотореализм",
-        "anime": "🎨 Аниме",
-        "cyber": "🌃 Киберпанк",
-        "candy": "🍭 3D Candy",
-        "watercolor": "🖼 Акварель",
-        "oil": "🖌 Масло",
-        "game": "🎮 Видеоигра",
-        "vintage": "📷 Винтаж",
-        "none": "✨ Без стиля"
-    }
-    
-    text = f"✅ Стиль выбран: {style_names.get(style, 'Без стиля')}\n\nТеперь отправь мне текстовое описание картинки!\n\n🎲 Или используй кнопки меню для случайного/популярного промта."
-    
-    try:
-        await callback.message.edit_text(text, reply_markup=main_menu_keyboard())
-    except Exception:
-        await callback.message.answer(text, reply_markup=main_menu_keyboard())
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("reg|"))
-async def regenerate_image(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    update_activity(user_id)
-    
-    now = datetime.now()
-    last_time = last_request_time.get(user_id)
-    if last_time and (now - last_time).seconds < 5:
-        await callback.answer("⏳ Подожди 5 секунд!", show_alert=True)
-        return
-    last_request_time[user_id] = now
-    
-    data = callback.data.split("|")
-    if len(data) >= 2:
-        style = data[1]
-        user_style[user_id] = style
-        save_user_style(user_id, style)
-    
-    prompt = last_user_prompt.get(user_id)
-    if not prompt:
-        await callback.answer("❌ Не найден предыдущий промт")
-        return
-    
-    await callback.answer("🔄 Генерирую...")
-    
-    free_left = get_free_generations(user_id)
-    if free_left > 0:
-        await generate_and_send(callback.message, user_id, prompt, is_free=True)
-    else:
-        await callback.message.answer("❌ Бесплатные генерации закончились.")
-
-@router.callback_query(F.data.startswith("fav|"))
-async def add_to_favorites_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    image_id = int(callback.data.split("|")[1])
-    
-    if add_to_favorites(user_id, image_id):
-        await callback.answer("❤️ Добавлено в избранное!")
-    else:
-        await callback.answer("⚠️ Уже в избранном!")
-
-# ==================== ОСНОВНЫЕ ОБРАБОТЧИКИ ====================
+# ==================== КОМАНДЫ ====================
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     user_id = message.from_user.id
@@ -731,111 +558,6 @@ async def cmd_start(message: Message):
     
     await message.answer(welcome_text, reply_markup=main_menu_keyboard())
 
-@router.message(F.text)
-async def handle_prompt(message: Message):
-    user_id = message.from_user.id
-    
-    now = datetime.now()
-    last_time = last_request_time.get(user_id)
-    if last_time and (now - last_time).seconds < 5:
-        await message.answer("⏳ Подожди 5 секунд перед следующим запросом!")
-        return
-    last_request_time[user_id] = now
-    
-    update_activity(user_id)
-    
-    prompt = message.text.strip()
-    
-    if prompt.startswith('/'):
-        return
-    
-    last_user_prompt[user_id] = prompt
-    
-    free_left = get_free_generations(user_id)
-    
-    if free_left > 0:
-        await generate_and_send(message, user_id, prompt, is_free=True)
-    else:
-        await message.answer(
-            "❌ Бесплатные генерации закончились.\n\n"
-            "📦 Получи ежедневный бонус в меню!\n"
-            "👑 Или напиши администратору.",
-            reply_markup=main_menu_keyboard()
-        )
-
-async def generate_and_send(message: Message, user_id: int, prompt: str, is_free: bool = False):
-    """Общая функция генерации и отправки с сохранением file_id"""
-    style = user_style.get(user_id, get_user_style(user_id))
-    
-    style_prompts_dict = style_prompts()
-    style_prompt = style_prompts_dict.get(style, "")
-    
-    full_prompt = prompt.strip()
-    if style != "none" and style_prompt:
-        full_prompt = f"{full_prompt}, {style_prompt}"
-    
-    if len(full_prompt) > 400:
-        full_prompt = full_prompt[:400]
-        await message.answer("⚠️ Промт слишком длинный, я немного сократил его.")
-    
-    daily_count = get_daily_generations(user_id)
-    if daily_count >= DAILY_LIMIT:
-        await message.answer(f"⏳ Дневной лимит ({DAILY_LIMIT}) исчерпан.\nПриходи завтра!")
-        return
-    
-    # Запускаем анимацию загрузки
-    loading_task = asyncio.create_task(show_loading_animation(message))
-    
-    try:
-        image_bytes = await generate_gigachat_image(full_prompt)
-    except Exception as e:
-        logging.error(f"Generation exception: {e}")
-        await message.answer("⚠️ Ошибка при генерации. Попробуй более простой промт.")
-        return
-    finally:
-        loading_task.cancel()
-    
-    if image_bytes:
-        if is_free:
-            use_free_generation(user_id)
-            free_text = f"\n🎁 Бесплатных осталось: {get_free_generations(user_id)}"
-        else:
-            free_text = ""
-        
-        # Отправляем фото
-        photo_file = BufferedInputFile(image_bytes, filename="image.jpg")
-        sent_message = await message.answer_photo(
-            photo=photo_file,
-            caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}"
-        )
-        
-        # Получаем реальный file_id отправленного фото
-        if sent_message.photo:
-            file_id = sent_message.photo[-1].file_id
-            
-            # Сохраняем в историю с реальным file_id
-            image_id = save_to_history(user_id, prompt, file_id)
-            
-            # Редактируем сообщение, добавляя ID и кнопки
-            reply_markup = after_generation_keyboard(style, image_id)
-            try:
-                await sent_message.edit_caption(
-                    caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}\n🆔 ID: {image_id}",
-                    reply_markup=reply_markup
-                )
-            except Exception as e:
-                logging.error(f"Error editing caption: {e}")
-    else:
-        await message.answer(
-            "⚠️ Не удалось сгенерировать изображение.\n\n"
-            "Попробуй:\n"
-            "• Упростить промт\n"
-            "• Сделать запрос короче\n"
-            "• Использовать английский язык\n\n"
-            "🎲 Или попробуй случайный промт в меню!"
-        )
-
-# ==================== КОМАНДЫ ====================
 @router.message(Command("status"))
 async def cmd_status(message: Message):
     user_id = message.from_user.id
@@ -871,7 +593,6 @@ async def cmd_history(message: Message):
             await asyncio.sleep(0.5)
         except Exception as e:
             logging.error(f"Error showing history {img_id}: {e}")
-            await message.answer(f"⚠️ Картинка {img_id} недоступна.")
 
 @router.message(Command("search"))
 async def cmd_search(message: Message):
@@ -919,7 +640,6 @@ async def cmd_favorites(message: Message):
         except Exception as e:
             logging.error(f"Error showing favorite {img_id}: {e}")
             remove_from_favorites(user_id, img_id)
-            await message.answer(f"⚠️ Картинка {img_id} недоступна, удалена из избранного.")
 
 @router.message(Command("export"))
 async def cmd_export(message: Message):
@@ -936,7 +656,6 @@ async def cmd_export(message: Message):
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         for idx, (img_id, prompt, file_id) in enumerate(history):
             try:
-                # Получаем файл по file_id
                 file = await bot.get_file(file_id)
                 file_bytes = await bot.download_file(file.file_path)
                 safe_prompt = "".join(c for c in prompt[:30] if c.isalnum() or c in " _-").strip()
@@ -1059,6 +778,299 @@ async def cmd_broadcast(message: Message):
         except:
             pass
     await message.answer(f"Рассылка отправлена {success} пользователям.")
+
+# ==================== CALLBACK ОБРАБОТЧИКИ ====================
+@router.callback_query(F.data == "back_to_menu")
+async def back_to_menu(callback: CallbackQuery):
+    try:
+        await callback.message.edit_text("📋 Главное меню:", reply_markup=main_menu_keyboard())
+    except Exception:
+        await callback.message.answer("📋 Главное меню:", reply_markup=main_menu_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data == "show_styles")
+async def show_styles(callback: CallbackQuery):
+    try:
+        await callback.message.edit_text("🎨 Выбери стиль:", reply_markup=style_keyboard())
+    except Exception:
+        await callback.message.answer("🎨 Выбери стиль:", reply_markup=style_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data == "show_status")
+async def show_status_callback(callback: CallbackQuery):
+    await cmd_status(callback.message)
+    await callback.answer()
+
+@router.callback_query(F.data == "show_free")
+async def show_free_callback(callback: CallbackQuery):
+    free_left = get_free_generations(callback.from_user.id)
+    await callback.message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.")
+    await callback.answer()
+
+@router.callback_query(F.data == "daily_bonus")
+async def daily_bonus_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if can_claim_daily_bonus(user_id):
+        claim_daily_bonus(user_id)
+        free_left = get_free_generations(user_id)
+        await callback.message.answer(f"✅ Ты получил ежедневный бонус +{DAILY_BONUS} генераций!\n\n🎁 Теперь у тебя {free_left} бесплатных генераций.")
+    else:
+        await callback.message.answer("⏳ Ты уже получал бонус сегодня. Приходи завтра!")
+    
+    await callback.answer()
+
+@router.callback_query(F.data == "random_prompt")
+async def random_prompt_callback(callback: CallbackQuery):
+    prompt = random.choice(RANDOM_PROMPTS)
+    user_id = callback.from_user.id
+    
+    await callback.answer(f"🎲 Выбран промт: {prompt}")
+    
+    last_user_prompt[user_id] = prompt
+    
+    free_left = get_free_generations(user_id)
+    if free_left > 0:
+        await generate_and_send(callback.message, user_id, prompt, is_free=True)
+    else:
+        await callback.message.answer("❌ Бесплатные генерации закончились. Получи ежедневный бонус или напиши администратору.")
+
+@router.callback_query(F.data == "show_popular")
+async def show_popular(callback: CallbackQuery):
+    """Показывает популярные промты"""
+    try:
+        await callback.message.edit_text(
+            "🔥 Популярные промты (нажми на кнопку, чтобы выбрать):", 
+            reply_markup=popular_prompts_keyboard()
+        )
+    except Exception as e:
+        logging.error(f"Error in show_popular: {e}")
+        await callback.message.answer(
+            "🔥 Популярные промты (нажми на кнопку, чтобы выбрать):", 
+            reply_markup=popular_prompts_keyboard()
+        )
+    await callback.answer()
+
+@router.callback_query(F.data == "show_favorites")
+async def show_favorites_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    favorites = get_favorites(user_id)
+    
+    if not favorites:
+        await callback.message.answer("❤️ У тебя пока нет избранных картинок. Чтобы добавить, нажми ❤️ В избранное после генерации.")
+        await callback.answer()
+        return
+    
+    await callback.message.answer(f"❤️ Твои избранные картинки ({len(favorites)}):")
+    
+    for img_id, prompt, file_id in favorites:
+        try:
+            await callback.message.answer_photo(
+                photo=file_id,
+                caption=f"📝 {prompt[:60]}\n🆔 ID: {img_id}\n❤️ В избранном"
+            )
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logging.error(f"Error showing favorite {img_id}: {e}")
+            remove_from_favorites(user_id, img_id)
+            await callback.message.answer(f"⚠️ Картинка {img_id} недоступна, удалена из избранного.")
+    
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("prompt|"))
+async def use_selected_prompt(callback: CallbackQuery):
+    """Обработчик выбора промта из популярных"""
+    prompt = callback.data.split("|")[1]
+    user_id = callback.from_user.id
+    
+    await callback.answer(f"✅ Выбран промт: {prompt[:50]}...")
+    
+    last_user_prompt[user_id] = prompt
+    
+    free_left = get_free_generations(user_id)
+    if free_left > 0:
+        await generate_and_send(callback.message, user_id, prompt, is_free=True)
+    else:
+        await callback.message.answer(
+            "❌ Бесплатные генерации закончились.\n\n"
+            "📦 Получи ежедневный бонус в меню!\n"
+            "👑 Или напиши администратору.",
+            reply_markup=main_menu_keyboard()
+        )
+
+@router.callback_query(F.data.startswith("style_"))
+async def choose_style(callback: CallbackQuery):
+    style = callback.data.split("_")[1]
+    user_id = callback.from_user.id
+    user_style[user_id] = style
+    save_user_style(user_id, style)
+    
+    style_names = {
+        "photo": "📸 Фотореализм",
+        "anime": "🎨 Аниме",
+        "cyber": "🌃 Киберпанк",
+        "candy": "🍭 3D Candy",
+        "watercolor": "🖼 Акварель",
+        "oil": "🖌 Масло",
+        "game": "🎮 Видеоигра",
+        "vintage": "📷 Винтаж",
+        "none": "✨ Без стиля"
+    }
+    
+    text = f"✅ Стиль выбран: {style_names.get(style, 'Без стиля')}\n\nТеперь отправь мне текстовое описание картинки!\n\n🎲 Или используй кнопки меню для случайного/популярного промта."
+    
+    try:
+        await callback.message.edit_text(text, reply_markup=main_menu_keyboard())
+    except Exception:
+        await callback.message.answer(text, reply_markup=main_menu_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("reg|"))
+async def regenerate_image(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    update_activity(user_id)
+    
+    now = datetime.now()
+    last_time = last_request_time.get(user_id)
+    if last_time and (now - last_time).seconds < 5:
+        await callback.answer("⏳ Подожди 5 секунд!", show_alert=True)
+        return
+    last_request_time[user_id] = now
+    
+    data = callback.data.split("|")
+    if len(data) >= 2:
+        style = data[1]
+        user_style[user_id] = style
+        save_user_style(user_id, style)
+    
+    prompt = last_user_prompt.get(user_id)
+    if not prompt:
+        await callback.answer("❌ Не найден предыдущий промт")
+        return
+    
+    await callback.answer("🔄 Генерирую...")
+    
+    free_left = get_free_generations(user_id)
+    if free_left > 0:
+        await generate_and_send(callback.message, user_id, prompt, is_free=True)
+    else:
+        await callback.message.answer("❌ Бесплатные генерации закончились.")
+
+@router.callback_query(F.data.startswith("fav|"))
+async def add_to_favorites_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    image_id = int(callback.data.split("|")[1])
+    
+    if add_to_favorites(user_id, image_id):
+        await callback.answer("❤️ Добавлено в избранное!")
+    else:
+        await callback.answer("⚠️ Уже в избранном!")
+
+# ==================== ОБРАБОТЧИК ТЕКСТА ====================
+@router.message(F.text)
+async def handle_prompt(message: Message):
+    user_id = message.from_user.id
+    
+    now = datetime.now()
+    last_time = last_request_time.get(user_id)
+    if last_time and (now - last_time).seconds < 5:
+        await message.answer("⏳ Подожди 5 секунд перед следующим запросом!")
+        return
+    last_request_time[user_id] = now
+    
+    update_activity(user_id)
+    
+    prompt = message.text.strip()
+    
+    if prompt.startswith('/'):
+        return
+    
+    last_user_prompt[user_id] = prompt
+    
+    free_left = get_free_generations(user_id)
+    
+    if free_left > 0:
+        await generate_and_send(message, user_id, prompt, is_free=True)
+    else:
+        await message.answer(
+            "❌ Бесплатные генерации закончились.\n\n"
+            "📦 Получи ежедневный бонус в меню!\n"
+            "👑 Или напиши администратору.",
+            reply_markup=main_menu_keyboard()
+        )
+
+# ==================== ФУНКЦИЯ ГЕНЕРАЦИИ ====================
+async def generate_and_send(message: Message, user_id: int, prompt: str, is_free: bool = False):
+    """Общая функция генерации и отправки с сохранением file_id"""
+    style = user_style.get(user_id, get_user_style(user_id))
+    
+    style_prompts_dict = style_prompts()
+    style_prompt = style_prompts_dict.get(style, "")
+    
+    full_prompt = prompt.strip()
+    if style != "none" and style_prompt:
+        full_prompt = f"{full_prompt}, {style_prompt}"
+    
+    if len(full_prompt) > 400:
+        full_prompt = full_prompt[:400]
+        await message.answer("⚠️ Промт слишком длинный, я немного сократил его.")
+    
+    daily_count = get_daily_generations(user_id)
+    if daily_count >= DAILY_LIMIT:
+        await message.answer(f"⏳ Дневной лимит ({DAILY_LIMIT}) исчерпан.\nПриходи завтра!")
+        return
+    
+    # Запускаем анимацию загрузки
+    loading_task = asyncio.create_task(show_loading_animation(message))
+    
+    try:
+        image_bytes = await generate_gigachat_image(full_prompt)
+    except Exception as e:
+        logging.error(f"Generation exception: {e}")
+        await message.answer("⚠️ Ошибка при генерации. Попробуй более простой промт.")
+        return
+    finally:
+        loading_task.cancel()
+    
+    if image_bytes:
+        if is_free:
+            use_free_generation(user_id)
+            free_text = f"\n🎁 Бесплатных осталось: {get_free_generations(user_id)}"
+        else:
+            free_text = ""
+        
+        # Отправляем фото
+        photo_file = BufferedInputFile(image_bytes, filename="image.jpg")
+        sent_message = await message.answer_photo(
+            photo=photo_file,
+            caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}"
+        )
+        
+        # Получаем реальный file_id отправленного фото
+        if sent_message.photo:
+            file_id = sent_message.photo[-1].file_id
+            
+            # Сохраняем в историю с реальным file_id
+            image_id = save_to_history(user_id, prompt, file_id)
+            
+            # Редактируем сообщение, добавляя ID и кнопки
+            reply_markup = after_generation_keyboard(style, image_id)
+            try:
+                await sent_message.edit_caption(
+                    caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}\n🆔 ID: {image_id}",
+                    reply_markup=reply_markup
+                )
+            except Exception as e:
+                logging.error(f"Error editing caption: {e}")
+    else:
+        await message.answer(
+            "⚠️ Не удалось сгенерировать изображение.\n\n"
+            "Попробуй:\n"
+            "• Упростить промт\n"
+            "• Сделать запрос короче\n"
+            "• Использовать английский язык\n\n"
+            "🎲 Или попробуй случайный промт в меню!"
+        )
 
 # ==================== HEALTH CHECK ДЛЯ RENDER ====================
 async def health_check_server():
