@@ -365,7 +365,7 @@ def popular_prompts_keyboard():
     return builder.as_markup()
 
 def after_generation_keyboard(style: str, image_id: int):
-    """Клавиатура, которая появляется после генерации"""
+    """Инлайн-клавиатура, которая появляется после генерации"""
     builder = InlineKeyboardBuilder()
     builder.button(text="🔄 Ещё раз", callback_data=f"reg|{style}")
     builder.button(text="🎨 Стиль", callback_data="show_styles")
@@ -589,7 +589,6 @@ async def cmd_start(message: Message):
         "👇 **Нажми кнопку \"📋 Меню\" внизу**, чтобы открыть все возможности!"
     )
     
-    # Отправляем приветствие с постоянной клавиатурой
     await message.answer(
         welcome_text,
         reply_markup=get_main_reply_keyboard()
@@ -982,6 +981,7 @@ async def choose_style(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("reg|"))
 async def regenerate_image(callback: CallbackQuery):
+    """Обработчик кнопки 'Ещё раз'"""
     user_id = callback.from_user.id
     update_activity(user_id)
     
@@ -1009,7 +1009,10 @@ async def regenerate_image(callback: CallbackQuery):
     if free_left > 0:
         await generate_and_send(callback.message, user_id, prompt, is_free=True)
     else:
-        await callback.message.answer("❌ Бесплатные генерации закончились.", reply_markup=get_main_reply_keyboard())
+        await callback.message.answer(
+            "❌ Бесплатные генерации закончились.\n\n📦 Получи ежедневный бонус в меню!",
+            reply_markup=get_main_reply_keyboard()
+        )
 
 @router.callback_query(F.data.startswith("fav|"))
 async def add_to_favorites_callback(callback: CallbackQuery):
@@ -1057,7 +1060,7 @@ async def handle_prompt(message: Message):
 
 # ==================== ФУНКЦИЯ ГЕНЕРАЦИИ ====================
 async def generate_and_send(message: Message, user_id: int, prompt: str, is_free: bool = False):
-    """Общая функция генерации и отправки с сохранением file_id"""
+    """Общая функция генерации и отправки с сохранением file_id и инлайн-кнопками"""
     style = user_style.get(user_id, get_user_style(user_id))
     
     style_prompts_dict = style_prompts()
@@ -1095,12 +1098,11 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
         else:
             free_text = ""
         
-        # Отправляем фото
+        # Отправляем фото БЕЗ reply_markup (чтобы не заменять reply-клавиатуру)
         photo_file = BufferedInputFile(image_bytes, filename="image.jpg")
         sent_message = await message.answer_photo(
             photo=photo_file,
-            caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}",
-            reply_markup=get_main_reply_keyboard()
+            caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}"
         )
         
         # Получаем реальный file_id отправленного фото
@@ -1110,7 +1112,7 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
             # Сохраняем в историю с реальным file_id
             image_id = save_to_history(user_id, prompt, file_id)
             
-            # Редактируем сообщение, добавляя ID и кнопки
+            # Редактируем сообщение, добавляя ID и инлайн-кнопки
             reply_markup = after_generation_keyboard(style, image_id)
             try:
                 await sent_message.edit_caption(
