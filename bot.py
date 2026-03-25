@@ -16,7 +16,8 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    Message, BufferedInputFile, BotCommand
+    Message, BufferedInputFile, BotCommand, ReplyKeyboardMarkup,
+    KeyboardButton
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
@@ -45,9 +46,6 @@ last_user_prompt = {}
 
 # Для ограничения частоты запросов
 last_request_time = {}
-
-# Хранилище ID закреплённого меню для каждого пользователя
-user_menu_messages = {}
 
 # Лимиты
 DAILY_LIMIT = 100
@@ -305,6 +303,15 @@ def is_favorite(user_id: int, image_id: int) -> bool:
     return row is not None
 
 # ========================= КНОПКИ =========================
+def get_main_reply_keyboard():
+    """Постоянная Reply-клавиатура с кнопкой Меню"""
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📋 Меню")]],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+    return keyboard
+
 def style_keyboard():
     builder = InlineKeyboardBuilder()
     styles = [
@@ -558,29 +565,6 @@ async def set_commands():
     
     await bot.set_my_commands(commands)
 
-async def send_or_update_menu(message: Message, user_id: int):
-    """Отправляет или обновляет закреплённое меню"""
-    menu_text = (
-        "📋 **Главное меню**\n\n"
-        "👇 Нажми на кнопку, чтобы выбрать действие:"
-    )
-    reply_markup = main_menu_keyboard()
-    
-    # Если у пользователя уже есть закреплённое меню
-    if user_id in user_menu_messages:
-        try:
-            await user_menu_messages[user_id].edit_text(
-                menu_text, 
-                reply_markup=reply_markup
-            )
-            return
-        except:
-            pass
-    
-    # Отправляем новое меню
-    sent = await message.answer(menu_text, reply_markup=reply_markup)
-    user_menu_messages[user_id] = sent
-
 # ==================== КОМАНДЫ ====================
 @router.message(CommandStart())
 async def cmd_start(message: Message):
@@ -602,14 +586,22 @@ async def cmd_start(message: Message):
         "• 📦 Ежедневный бонус\n"
         "• 🔍 Поиск по истории /search\n"
         "• 📦 Экспорт в ZIP /export\n\n"
-        "👇 Используй кнопки ниже или команды!\n"
-        "📌 **Кнопка меню** — в левом нижнем углу экрана"
+        "👇 **Нажми кнопку \"📋 Меню\" внизу**, чтобы открыть все возможности!"
     )
     
-    await message.answer(welcome_text)
-    
-    # Отправляем закреплённое меню
-    await send_or_update_menu(message, user_id)
+    # Отправляем приветствие с постоянной клавиатурой
+    await message.answer(
+        welcome_text,
+        reply_markup=get_main_reply_keyboard()
+    )
+
+@router.message(F.text == "📋 Меню")
+async def show_main_menu(message: Message):
+    """Обработчик нажатия на кнопку Меню"""
+    await message.answer(
+        "📋 **Главное меню**\n\n👇 Выбери действие:",
+        reply_markup=main_menu_keyboard()
+    )
 
 @router.message(Command("status"))
 async def cmd_status(message: Message):
@@ -623,7 +615,8 @@ async def cmd_status(message: Message):
         f"🎨 **Стиль:** {style}\n"
         f"🖼 **Сегодня:** {gens_today}/{DAILY_LIMIT} генераций\n"
         f"🎁 **Бесплатных осталось:** {free_left}\n\n"
-        f"📦 Ежедневный бонус: +{DAILY_BONUS} генераций"
+        f"📦 Ежедневный бонус: +{DAILY_BONUS} генераций",
+        reply_markup=get_main_reply_keyboard()
     )
 
 @router.message(Command("history"))
@@ -632,10 +625,10 @@ async def cmd_history(message: Message):
     rows = get_history(user_id, limit=5)
     
     if not rows:
-        await message.answer("📭 История пуста. Сгенерируй первую картинку!")
+        await message.answer("📭 История пуста. Сгенерируй первую картинку!", reply_markup=get_main_reply_keyboard())
         return
     
-    await message.answer(f"🖼 Последние 5 генераций:")
+    await message.answer(f"🖼 Последние 5 генераций:", reply_markup=get_main_reply_keyboard())
     for img_id, prompt, file_id in rows:
         try:
             fav_mark = "❤️ " if is_favorite(user_id, img_id) else ""
@@ -653,16 +646,16 @@ async def cmd_search(message: Message):
     search_text = message.text.replace("/search", "").strip()
     
     if not search_text:
-        await message.answer("🔍 Укажи текст для поиска. Пример: /search кот")
+        await message.answer("🔍 Укажи текст для поиска. Пример: /search кот", reply_markup=get_main_reply_keyboard())
         return
     
     rows = get_history(user_id, limit=5, search=search_text)
     
     if not rows:
-        await message.answer(f"🔍 Ничего не найдено по запросу '{search_text}'")
+        await message.answer(f"🔍 Ничего не найдено по запросу '{search_text}'", reply_markup=get_main_reply_keyboard())
         return
     
-    await message.answer(f"🔍 Результаты поиска '{search_text}':")
+    await message.answer(f"🔍 Результаты поиска '{search_text}':", reply_markup=get_main_reply_keyboard())
     for img_id, prompt, file_id in rows:
         try:
             await message.answer_photo(
@@ -679,10 +672,10 @@ async def cmd_favorites(message: Message):
     favorites = get_favorites(user_id)
     
     if not favorites:
-        await message.answer("❤️ У тебя пока нет избранных картинок. Чтобы добавить, нажми ❤️ В избранное после генерации.")
+        await message.answer("❤️ У тебя пока нет избранных картинок. Чтобы добавить, нажми ❤️ В избранное после генерации.", reply_markup=get_main_reply_keyboard())
         return
     
-    await message.answer(f"❤️ Твои избранные картинки ({len(favorites)}):")
+    await message.answer(f"❤️ Твои избранные картинки ({len(favorites)}):", reply_markup=get_main_reply_keyboard())
     for img_id, prompt, file_id in favorites:
         try:
             await message.answer_photo(
@@ -700,10 +693,10 @@ async def cmd_export(message: Message):
     history = get_all_history(user_id)
     
     if not history:
-        await message.answer("📭 Нет картинок для экспорта.")
+        await message.answer("📭 Нет картинок для экспорта.", reply_markup=get_main_reply_keyboard())
         return
     
-    await message.answer("📦 Создаю архив... Это может занять несколько секунд.")
+    await message.answer("📦 Создаю архив... Это может занять несколько секунд.", reply_markup=get_main_reply_keyboard())
     
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
@@ -722,13 +715,14 @@ async def cmd_export(message: Message):
     
     await message.answer_document(
         document=BufferedInputFile(zip_buffer.getvalue(), filename=f"generations_{user_id}.zip"),
-        caption=f"📦 Экспорт {len(history)} картинок"
+        caption=f"📦 Экспорт {len(history)} картинок",
+        reply_markup=get_main_reply_keyboard()
     )
 
 @router.message(Command("free"))
 async def cmd_free(message: Message):
     free_left = get_free_generations(message.from_user.id)
-    await message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.\n\n📦 Ежедневный бонус: +{DAILY_BONUS} генераций в день!")
+    await message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.\n\n📦 Ежедневный бонус: +{DAILY_BONUS} генераций в день!", reply_markup=get_main_reply_keyboard())
 
 @router.message(Command("bonus"))
 async def cmd_bonus(message: Message):
@@ -736,9 +730,9 @@ async def cmd_bonus(message: Message):
     if can_claim_daily_bonus(user_id):
         claim_daily_bonus(user_id)
         free_left = get_free_generations(user_id)
-        await message.answer(f"✅ Ты получил ежедневный бонус +{DAILY_BONUS} генераций!\n\n🎁 Теперь у тебя {free_left} бесплатных генераций.")
+        await message.answer(f"✅ Ты получил ежедневный бонус +{DAILY_BONUS} генераций!\n\n🎁 Теперь у тебя {free_left} бесплатных генераций.", reply_markup=get_main_reply_keyboard())
     else:
-        await message.answer("⏳ Ты уже получал бонус сегодня. Приходи завтра!")
+        await message.answer("⏳ Ты уже получал бонус сегодня. Приходи завтра!", reply_markup=get_main_reply_keyboard())
 
 # ==================== АДМИН-КОМАНДЫ ====================
 @router.message(Command("admin"))
@@ -750,7 +744,8 @@ async def cmd_admin(message: Message):
         "/stats — статистика\n"
         "/broadcast [текст] — рассылка\n"
         "/gift [user_id] — добавить 10 бесплатных пользователю\n"
-        "/add_gen [user_id] [количество] — добавить генерации"
+        "/add_gen [user_id] [количество] — добавить генерации",
+        reply_markup=get_main_reply_keyboard()
     )
 
 @router.message(Command("stats"))
@@ -773,7 +768,8 @@ async def cmd_stats(message: Message):
         f"👥 Всего пользователей: {total_users}\n"
         f"🎁 Всего бесплатных осталось: {free_remaining}\n"
         f"🖼 Всего сгенерировано: {total_images}\n"
-        f"❤️ Всего в избранном: {total_favorites}"
+        f"❤️ Всего в избранном: {total_favorites}",
+        reply_markup=get_main_reply_keyboard()
     )
 
 @router.message(Command("gift"))
@@ -782,14 +778,14 @@ async def cmd_gift(message: Message):
         return
     parts = message.text.split()
     if len(parts) != 2:
-        await message.answer("Формат: /gift [user_id]")
+        await message.answer("Формат: /gift [user_id]", reply_markup=get_main_reply_keyboard())
         return
     try:
         user_id = int(parts[1])
         reset_free_generations(user_id)
-        await message.answer(f"✅ Пользователю {user_id} выдано {FREE_GENERATIONS} бесплатных генераций!")
+        await message.answer(f"✅ Пользователю {user_id} выдано {FREE_GENERATIONS} бесплатных генераций!", reply_markup=get_main_reply_keyboard())
     except:
-        await message.answer("Ошибка: укажи правильный user_id")
+        await message.answer("Ошибка: укажи правильный user_id", reply_markup=get_main_reply_keyboard())
 
 @router.message(Command("add_gen"))
 async def cmd_add_gen(message: Message):
@@ -797,15 +793,15 @@ async def cmd_add_gen(message: Message):
         return
     parts = message.text.split()
     if len(parts) != 3:
-        await message.answer("Формат: /add_gen [user_id] [количество]")
+        await message.answer("Формат: /add_gen [user_id] [количество]", reply_markup=get_main_reply_keyboard())
         return
     try:
         user_id = int(parts[1])
         amount = int(parts[2])
         add_free_generations(user_id, amount)
-        await message.answer(f"✅ Пользователю {user_id} добавлено {amount} бесплатных генераций!")
+        await message.answer(f"✅ Пользователю {user_id} добавлено {amount} бесплатных генераций!", reply_markup=get_main_reply_keyboard())
     except:
-        await message.answer("Ошибка: укажи правильные данные")
+        await message.answer("Ошибка: укажи правильные данные", reply_markup=get_main_reply_keyboard())
 
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: Message):
@@ -813,7 +809,7 @@ async def cmd_broadcast(message: Message):
         return
     text = message.text.replace("/broadcast", "").strip()
     if not text:
-        await message.answer("Укажи текст для рассылки после команды.")
+        await message.answer("Укажи текст для рассылки после команды.", reply_markup=get_main_reply_keyboard())
         return
     
     conn = sqlite3.connect(DB_FILE)
@@ -830,12 +826,11 @@ async def cmd_broadcast(message: Message):
             await asyncio.sleep(0.05)
         except:
             pass
-    await message.answer(f"Рассылка отправлена {success} пользователям.")
+    await message.answer(f"Рассылка отправлена {success} пользователям.", reply_markup=get_main_reply_keyboard())
 
 # ==================== CALLBACK ОБРАБОТЧИКИ ====================
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery):
-    user_id = callback.from_user.id
     try:
         await callback.message.edit_text(
             "📋 **Главное меню**\n\n👇 Нажми на кнопку, чтобы выбрать действие:",
@@ -847,16 +842,6 @@ async def back_to_menu(callback: CallbackQuery):
             reply_markup=main_menu_keyboard()
         )
     await callback.answer()
-    
-    # Обновляем закреплённое меню
-    if user_id in user_menu_messages:
-        try:
-            await user_menu_messages[user_id].edit_text(
-                "📋 **Главное меню**\n\n👇 Нажми на кнопку, чтобы выбрать действие:",
-                reply_markup=main_menu_keyboard()
-            )
-        except:
-            pass
 
 @router.callback_query(F.data == "show_styles")
 async def show_styles(callback: CallbackQuery):
@@ -874,7 +859,7 @@ async def show_status_callback(callback: CallbackQuery):
 @router.callback_query(F.data == "show_free")
 async def show_free_callback(callback: CallbackQuery):
     free_left = get_free_generations(callback.from_user.id)
-    await callback.message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.")
+    await callback.message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.", reply_markup=get_main_reply_keyboard())
     await callback.answer()
 
 @router.callback_query(F.data == "daily_bonus")
@@ -884,9 +869,9 @@ async def daily_bonus_callback(callback: CallbackQuery):
     if can_claim_daily_bonus(user_id):
         claim_daily_bonus(user_id)
         free_left = get_free_generations(user_id)
-        await callback.message.answer(f"✅ Ты получил ежедневный бонус +{DAILY_BONUS} генераций!\n\n🎁 Теперь у тебя {free_left} бесплатных генераций.")
+        await callback.message.answer(f"✅ Ты получил ежедневный бонус +{DAILY_BONUS} генераций!\n\n🎁 Теперь у тебя {free_left} бесплатных генераций.", reply_markup=get_main_reply_keyboard())
     else:
-        await callback.message.answer("⏳ Ты уже получал бонус сегодня. Приходи завтра!")
+        await callback.message.answer("⏳ Ты уже получал бонус сегодня. Приходи завтра!", reply_markup=get_main_reply_keyboard())
     
     await callback.answer()
 
@@ -903,7 +888,7 @@ async def random_prompt_callback(callback: CallbackQuery):
     if free_left > 0:
         await generate_and_send(callback.message, user_id, prompt, is_free=True)
     else:
-        await callback.message.answer("❌ Бесплатные генерации закончились. Получи ежедневный бонус или напиши администратору.")
+        await callback.message.answer("❌ Бесплатные генерации закончились. Получи ежедневный бонус или напиши администратору.", reply_markup=get_main_reply_keyboard())
 
 @router.callback_query(F.data == "show_popular")
 async def show_popular(callback: CallbackQuery):
@@ -927,11 +912,11 @@ async def show_favorites_callback(callback: CallbackQuery):
     favorites = get_favorites(user_id)
     
     if not favorites:
-        await callback.message.answer("❤️ У тебя пока нет избранных картинок. Чтобы добавить, нажми ❤️ В избранное после генерации.")
+        await callback.message.answer("❤️ У тебя пока нет избранных картинок. Чтобы добавить, нажми ❤️ В избранное после генерации.", reply_markup=get_main_reply_keyboard())
         await callback.answer()
         return
     
-    await callback.message.answer(f"❤️ Твои избранные картинки ({len(favorites)}):")
+    await callback.message.answer(f"❤️ Твои избранные картинки ({len(favorites)}):", reply_markup=get_main_reply_keyboard())
     
     for img_id, prompt, file_id in favorites:
         try:
@@ -1024,7 +1009,7 @@ async def regenerate_image(callback: CallbackQuery):
     if free_left > 0:
         await generate_and_send(callback.message, user_id, prompt, is_free=True)
     else:
-        await callback.message.answer("❌ Бесплатные генерации закончились.")
+        await callback.message.answer("❌ Бесплатные генерации закончились.", reply_markup=get_main_reply_keyboard())
 
 @router.callback_query(F.data.startswith("fav|"))
 async def add_to_favorites_callback(callback: CallbackQuery):
@@ -1044,7 +1029,7 @@ async def handle_prompt(message: Message):
     now = datetime.now()
     last_time = last_request_time.get(user_id)
     if last_time and (now - last_time).seconds < 5:
-        await message.answer("⏳ Подожди 5 секунд перед следующим запросом!")
+        await message.answer("⏳ Подожди 5 секунд перед следующим запросом!", reply_markup=get_main_reply_keyboard())
         return
     last_request_time[user_id] = now
     
@@ -1052,7 +1037,8 @@ async def handle_prompt(message: Message):
     
     prompt = message.text.strip()
     
-    if prompt.startswith('/'):
+    # Если это команда или кнопка Меню — пропускаем
+    if prompt.startswith('/') or prompt == "📋 Меню":
         return
     
     last_user_prompt[user_id] = prompt
@@ -1066,7 +1052,7 @@ async def handle_prompt(message: Message):
             "❌ Бесплатные генерации закончились.\n\n"
             "📦 Получи ежедневный бонус в меню!\n"
             "👑 Или напиши администратору.",
-            reply_markup=main_menu_keyboard()
+            reply_markup=get_main_reply_keyboard()
         )
 
 # ==================== ФУНКЦИЯ ГЕНЕРАЦИИ ====================
@@ -1083,11 +1069,11 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
     
     if len(full_prompt) > 400:
         full_prompt = full_prompt[:400]
-        await message.answer("⚠️ Промт слишком длинный, я немного сократил его.")
+        await message.answer("⚠️ Промт слишком длинный, я немного сократил его.", reply_markup=get_main_reply_keyboard())
     
     daily_count = get_daily_generations(user_id)
     if daily_count >= DAILY_LIMIT:
-        await message.answer(f"⏳ Дневной лимит ({DAILY_LIMIT}) исчерпан.\nПриходи завтра!")
+        await message.answer(f"⏳ Дневной лимит ({DAILY_LIMIT}) исчерпан.\nПриходи завтра!", reply_markup=get_main_reply_keyboard())
         return
     
     # Запускаем анимацию загрузки
@@ -1097,7 +1083,7 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
         image_bytes = await generate_gigachat_image(full_prompt)
     except Exception as e:
         logging.error(f"Generation exception: {e}")
-        await message.answer("⚠️ Ошибка при генерации. Попробуй более простой промт.")
+        await message.answer("⚠️ Ошибка при генерации. Попробуй более простой промт.", reply_markup=get_main_reply_keyboard())
         return
     finally:
         loading_task.cancel()
@@ -1113,7 +1099,8 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
         photo_file = BufferedInputFile(image_bytes, filename="image.jpg")
         sent_message = await message.answer_photo(
             photo=photo_file,
-            caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}"
+            caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}",
+            reply_markup=get_main_reply_keyboard()
         )
         
         # Получаем реальный file_id отправленного фото
@@ -1139,7 +1126,8 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
             "• Упростить промт\n"
             "• Сделать запрос короче\n"
             "• Использовать английский язык\n\n"
-            "🎲 Или попробуй случайный промт в меню!"
+            "🎲 Или попробуй случайный промт в меню!",
+            reply_markup=get_main_reply_keyboard()
         )
 
 # ==================== HEALTH CHECK ДЛЯ RENDER ====================
