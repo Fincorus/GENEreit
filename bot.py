@@ -16,7 +16,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    Message, BufferedInputFile
+    Message, BufferedInputFile, BotCommand
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
@@ -45,6 +45,9 @@ last_user_prompt = {}
 
 # Для ограничения частоты запросов
 last_request_time = {}
+
+# Хранилище ID закреплённого меню для каждого пользователя
+user_menu_messages = {}
 
 # Лимиты
 DAILY_LIMIT = 100
@@ -532,6 +535,52 @@ async def show_loading_animation(message: Message, duration: int = 30):
         await asyncio.sleep(1)
     return loading_message
 
+# ==================== ФУНКЦИИ МЕНЮ ====================
+async def set_commands():
+    """Устанавливает кнопку меню в интерфейсе Telegram"""
+    commands = [
+        BotCommand(command="start", description="🏠 Главное меню"),
+        BotCommand(command="status", description="📊 Статус и баланс"),
+        BotCommand(command="history", description="🖼 Мои генерации"),
+        BotCommand(command="favorites", description="❤️ Избранное"),
+        BotCommand(command="search", description="🔍 Поиск по истории"),
+        BotCommand(command="export", description="📦 Экспорт в ZIP"),
+        BotCommand(command="free", description="🎁 Бесплатные генерации"),
+        BotCommand(command="bonus", description="📦 Ежедневный бонус"),
+    ]
+    
+    if ADMIN_ID:
+        commands.append(BotCommand(command="admin", description="🛠 Админ-панель"))
+        commands.append(BotCommand(command="stats", description="📊 Статистика"))
+        commands.append(BotCommand(command="broadcast", description="📢 Рассылка"))
+        commands.append(BotCommand(command="gift", description="🎁 Выдать бонус"))
+        commands.append(BotCommand(command="add_gen", description="➕ Добавить генерации"))
+    
+    await bot.set_my_commands(commands)
+
+async def send_or_update_menu(message: Message, user_id: int):
+    """Отправляет или обновляет закреплённое меню"""
+    menu_text = (
+        "📋 **Главное меню**\n\n"
+        "👇 Нажми на кнопку, чтобы выбрать действие:"
+    )
+    reply_markup = main_menu_keyboard()
+    
+    # Если у пользователя уже есть закреплённое меню
+    if user_id in user_menu_messages:
+        try:
+            await user_menu_messages[user_id].edit_text(
+                menu_text, 
+                reply_markup=reply_markup
+            )
+            return
+        except:
+            pass
+    
+    # Отправляем новое меню
+    sent = await message.answer(menu_text, reply_markup=reply_markup)
+    user_menu_messages[user_id] = sent
+
 # ==================== КОМАНДЫ ====================
 @router.message(CommandStart())
 async def cmd_start(message: Message):
@@ -553,10 +602,14 @@ async def cmd_start(message: Message):
         "• 📦 Ежедневный бонус\n"
         "• 🔍 Поиск по истории /search\n"
         "• 📦 Экспорт в ZIP /export\n\n"
-        "👇 Выбери действие в меню!"
+        "👇 Используй кнопки ниже или команды!\n"
+        "📌 **Кнопка меню** — в левом нижнем углу экрана"
     )
     
-    await message.answer(welcome_text, reply_markup=main_menu_keyboard())
+    await message.answer(welcome_text)
+    
+    # Отправляем закреплённое меню
+    await send_or_update_menu(message, user_id)
 
 @router.message(Command("status"))
 async def cmd_status(message: Message):
@@ -782,11 +835,28 @@ async def cmd_broadcast(message: Message):
 # ==================== CALLBACK ОБРАБОТЧИКИ ====================
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery):
+    user_id = callback.from_user.id
     try:
-        await callback.message.edit_text("📋 Главное меню:", reply_markup=main_menu_keyboard())
+        await callback.message.edit_text(
+            "📋 **Главное меню**\n\n👇 Нажми на кнопку, чтобы выбрать действие:",
+            reply_markup=main_menu_keyboard()
+        )
     except Exception:
-        await callback.message.answer("📋 Главное меню:", reply_markup=main_menu_keyboard())
+        await callback.message.answer(
+            "📋 **Главное меню**\n\n👇 Нажми на кнопку, чтобы выбрать действие:",
+            reply_markup=main_menu_keyboard()
+        )
     await callback.answer()
+    
+    # Обновляем закреплённое меню
+    if user_id in user_menu_messages:
+        try:
+            await user_menu_messages[user_id].edit_text(
+                "📋 **Главное меню**\n\n👇 Нажми на кнопку, чтобы выбрать действие:",
+                reply_markup=main_menu_keyboard()
+            )
+        except:
+            pass
 
 @router.callback_query(F.data == "show_styles")
 async def show_styles(callback: CallbackQuery):
@@ -1099,6 +1169,9 @@ async def main():
     init_db()
     
     asyncio.create_task(health_check_server())
+    
+    # Устанавливаем команды для кнопки меню в Telegram
+    await set_commands()
     
     logging.info("🚀 Бот GigaChat запущен! Все функции активны.")
     
