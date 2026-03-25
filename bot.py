@@ -6,6 +6,7 @@ import uuid
 import re
 import random
 import zipfile
+import traceback
 from io import BytesIO
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -46,6 +47,10 @@ last_user_prompt = {}
 
 # Для ограничения частоты запросов
 last_request_time = {}
+
+# Глобальная задержка между запросами к API
+last_api_request_time = None
+API_REQUEST_DELAY = 5  # минимум 5 секунд между запросами к API
 
 # Цены подписки (в Telegram Stars)
 PRICES = {1: 30, 7: 150, 30: 500}
@@ -406,7 +411,6 @@ def popular_prompts_keyboard():
     return builder.as_markup()
 
 def after_generation_keyboard(style: str, image_id: int, has_subscription: bool):
-    """Инлайн-клавиатура после генерации"""
     builder = InlineKeyboardBuilder()
     builder.button(text="🔄 Ещё раз", callback_data=f"reg|{style}")
     builder.button(text="🎨 Стиль", callback_data="show_styles")
@@ -470,6 +474,19 @@ async def get_gigachat_token() -> str | None:
             return token
 
 async def generate_gigachat_image(prompt: str) -> bytes | None:
+    """Генерирует изображение через GigaChat API с повторными попытками при 429"""
+    global last_api_request_time
+    
+    # Ожидаем, если последний запрос был слишком недавно
+    if last_api_request_time:
+        elapsed = (datetime.now() - last_api_request_time).total_seconds()
+        if elapsed < API_REQUEST_DELAY:
+            wait_time = API_REQUEST_DELAY - elapsed
+            logging.info(f"Waiting {wait_time:.1f}s before next API request")
+            await asyncio.sleep(wait_time)
+    
+    last_api_request_time = datetime.now()
+    
     token = await get_gigachat_token()
     if not token:
         return None
@@ -500,7 +517,7 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
     }
     
     async with aiohttp.ClientSession() as session:
-        for attempt in range(3):
+        for attempt in range(5):
             async with session.post(url, json=payload, headers=headers, ssl=False) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -549,15 +566,15 @@ async def generate_gigachat_image(prompt: str) -> bytes | None:
                     return None
                     
                 elif resp.status == 429:
-                    wait_time = (attempt + 1) * 5
-                    logging.warning(f"Rate limited (429), waiting {wait_time} seconds...")
+                    wait_time = (attempt + 1) * 10
+                    logging.warning(f"Rate limited (429), waiting {wait_time} seconds... (attempt {attempt+1}/5)")
                     await asyncio.sleep(wait_time)
                 else:
                     text = await resp.text()
                     logging.error(f"GigaChat generation error {resp.status}: {text}")
                     return None
         
-        logging.error("Failed after 3 attempts due to rate limiting")
+        logging.error("Failed after 5 attempts due to rate limiting")
         return None
 
 # ========================= БОТ =========================
@@ -652,7 +669,6 @@ async def cmd_start(message: Message):
     free_left = get_free_generations(user_id)
     style = get_user_style(user_id)
     user_style[user_id] = style
-    has_sub = has_active_subscription(user_id)
     
     welcome_text = (
         "🌟 Привет! Я генерирую крутые картинки через нейросеть GigaChat.\n\n"
@@ -666,7 +682,8 @@ async def cmd_start(message: Message):
         "• 📦 Ежедневный бонус для подписчиков\n"
         "• 🔍 Поиск по истории /search\n"
         "• 📦 Экспорт в ZIP /export\n\n"
-        "👇 **Нажми кнопку \"📋 Меню\" внизу**, чтобы открыть все возможности!"
+        "👇 **Нажми кнопку \"📋 Меню\" внизу**, чтобы открыть все возможности!\n"
+        "⏳ Между запросами нужно ждать 10 секунд."
     )
     
     await message.answer(
@@ -1136,8 +1153,8 @@ async def regenerate_image(callback: CallbackQuery):
     
     now = datetime.now()
     last_time = last_request_time.get(user_id)
-    if last_time and (now - last_time).seconds < 5:
-        await callback.answer("⏳ Подожди 5 секунд!", show_alert=True)
+    if last_time and (now - last_time).seconds < 10:
+        await callback.answer("⏳ Подожди 10 секунд!", show_alert=True)
         return
     last_request_time[user_id] = now
     
@@ -1183,8 +1200,8 @@ async def handle_prompt(message: Message):
     
     now = datetime.now()
     last_time = last_request_time.get(user_id)
-    if last_time and (now - last_time).seconds < 5:
-        await message.answer("⏳ Подожди 5 секунд перед следующим запросом!", reply_markup=get_main_reply_keyboard())
+    if last_time and (now - last_time).seconds < 10:
+        await message.answer("⏳ Подожди 10 секунд перед следующим запросом!", reply_markup=get_main_reply_keyboard())
         return
     last_request_time[user_id] = now
     
@@ -1226,20 +1243,41 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
         full_prompt = full_prompt[:400]
         await message.answer("⚠️ Промт слишком длинный, я немного сократил его.", reply_markup=get_main_reply_keyboard())
     
-    # Для подписчиков дневной лимит 100 (практически безлимит), для бесплатных - 5 бесплатных всего
     if not has_active_subscription(user_id):
         daily_count = get_daily_generations(user_id)
         if daily_count >= DAILY_LIMIT:
             await message.answer(f"⏳ Дневной лимит ({DAILY_LIMIT}) исчерпан.\nПриходи завтра!", reply_markup=get_main_reply_keyboard())
             return
     
+    logging.info(f"Generating image for user {user_id}, style: {style}, is_free: {is_free}, prompt: {prompt[:100]}...")
+    
     loading_task = asyncio.create_task(show_loading_animation(message))
     
     try:
         image_bytes = await generate_gigachat_image(full_prompt)
+        
+        if image_bytes is None:
+            logging.error(f"Generation returned None for user {user_id}, prompt: {full_prompt[:100]}")
+            await message.answer("⚠️ Не удалось сгенерировать изображение. Попробуй другой промт.", reply_markup=get_main_reply_keyboard())
+            return
+            
+        if len(image_bytes) < 1000:
+            logging.warning(f"Generated image too small: {len(image_bytes)} bytes for user {user_id}")
+            await message.answer("⚠️ Изображение получилось слишком маленьким. Попробуй другой промт.", reply_markup=get_main_reply_keyboard())
+            return
+            
+    except asyncio.TimeoutError as e:
+        logging.error(f"Timeout during generation for user {user_id}: {e}")
+        await message.answer("⏳ Превышено время ожидания. Попробуй упростить промт или повтори позже.", reply_markup=get_main_reply_keyboard())
+        return
+    except aiohttp.ClientError as e:
+        logging.error(f"Network error during generation for user {user_id}: {e}")
+        await message.answer("🌐 Ошибка сети. Попробуй позже.", reply_markup=get_main_reply_keyboard())
+        return
     except Exception as e:
-        logging.error(f"Generation exception: {e}")
-        await message.answer("⚠️ Ошибка при генерации. Попробуй более простой промт.", reply_markup=get_main_reply_keyboard())
+        logging.error(f"Unexpected generation exception for user {user_id}: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        await message.answer("⚠️ Неожиданная ошибка при генерации. Попробуй другой промт или повтори позже.", reply_markup=get_main_reply_keyboard())
         return
     finally:
         loading_task.cancel()
@@ -1314,7 +1352,7 @@ async def main():
     asyncio.create_task(monitor_bot_status())
     
     logging.info("🚀 Бот GigaChat запущен! Подписка активна, 5 бесплатных генераций.")
-    await notify_admin("✅ **Бот успешно запущен!**\n\n🎁 5 бесплатных генераций\n💎 Подписка через Stars\n📦 Ежедневный бонус для подписчиков")
+    await notify_admin("✅ **Бот успешно запущен!**\n\n🎁 5 бесплатных генераций\n💎 Подписка через Stars\n📦 Ежедневный бонус для подписчиков\n⏳ Задержка между запросами: 10 секунд")
     
     await dp.start_polling(bot, skip_updates=True)
 
