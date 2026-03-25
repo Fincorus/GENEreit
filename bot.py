@@ -17,7 +17,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
     Message, BufferedInputFile, BotCommand, ReplyKeyboardMarkup,
-    KeyboardButton
+    KeyboardButton, LabeledPrice, PreCheckoutQuery
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
@@ -47,10 +47,18 @@ last_user_prompt = {}
 # Для ограничения частоты запросов
 last_request_time = {}
 
+# Цены подписки (в Telegram Stars)
+PRICES = {1: 30, 7: 150, 30: 500}
+
+CONFIG_FILE = "config.json"
+if Path(CONFIG_FILE).exists():
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        PRICES = json.load(f)
+
 # Лимиты
-DAILY_LIMIT = 100
-FREE_GENERATIONS = 10
-DAILY_BONUS = 3
+DAILY_LIMIT = 100  # Безлимит для подписчиков
+FREE_GENERATIONS = 5  # 5 бесплатных для новых пользователей
+DAILY_BONUS = 3  # Ежедневный бонус для подписчиков
 
 DB_FILE = "bot.db"
 
@@ -97,6 +105,7 @@ def init_db():
         user_id INTEGER PRIMARY KEY,
         username TEXT,
         style TEXT DEFAULT 'none',
+        subscription_end TIMESTAMP,
         last_bonus TIMESTAMP
     )""")
     
@@ -110,7 +119,7 @@ def init_db():
     
     cur.execute("""CREATE TABLE IF NOT EXISTS free_generations (
         user_id INTEGER PRIMARY KEY,
-        remaining INTEGER DEFAULT 10
+        remaining INTEGER DEFAULT 5
     )""")
     
     cur.execute("""CREATE TABLE IF NOT EXISTS user_activity (
@@ -153,7 +162,33 @@ def save_user_style(user_id: int, style: str):
     conn.commit()
     conn.close()
 
+def get_user(user_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return datetime.fromisoformat(row[0]) if row and row[0] else None
+
+def update_subscription(user_id: int, days: int):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    now = datetime.now()
+    end = get_user(user_id) or now
+    new_end = max(end, now) + timedelta(days=days)
+    cur.execute("INSERT OR REPLACE INTO users (user_id, username, subscription_end) VALUES (?, ?, ?)",
+                (user_id, None, new_end.isoformat()))
+    conn.commit()
+    conn.close()
+
+def has_active_subscription(user_id: int) -> bool:
+    end = get_user(user_id)
+    return end is not None and end > datetime.now()
+
 def can_claim_daily_bonus(user_id: int) -> bool:
+    if not has_active_subscription(user_id):
+        return False
+    
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT last_bonus FROM users WHERE user_id = ?", (user_id,))
@@ -170,7 +205,7 @@ def claim_daily_bonus(user_id: int):
     cur = conn.cursor()
     cur.execute("INSERT OR REPLACE INTO users (user_id, last_bonus) VALUES (?, ?)", 
                 (user_id, datetime.now().isoformat()))
-    cur.execute("INSERT OR REPLACE INTO free_generations (user_id, remaining) VALUES (?, COALESCE((SELECT remaining FROM free_generations WHERE user_id = ?), 10) + ?)",
+    cur.execute("INSERT OR REPLACE INTO free_generations (user_id, remaining) VALUES (?, COALESCE((SELECT remaining FROM free_generations WHERE user_id = ?), 0) + ?)",
                 (user_id, user_id, DAILY_BONUS))
     conn.commit()
     conn.close()
@@ -230,7 +265,6 @@ def get_daily_generations(user_id: int) -> int:
     return count
 
 def save_to_history(user_id: int, prompt: str, file_id: str) -> int:
-    """Сохраняет file_id изображения в историю"""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("INSERT INTO history (user_id, prompt, image_url) VALUES (?, ?, ?)", 
@@ -241,7 +275,6 @@ def save_to_history(user_id: int, prompt: str, file_id: str) -> int:
     return image_id
 
 def get_history(user_id: int, limit=5, search=None):
-    """Возвращает историю с file_id"""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     if search:
@@ -255,7 +288,6 @@ def get_history(user_id: int, limit=5, search=None):
     return rows
 
 def get_all_history(user_id: int):
-    """Возвращает всю историю для экспорта"""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT id, prompt, image_url FROM history WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
@@ -283,7 +315,6 @@ def remove_from_favorites(user_id: int, image_id: int):
     conn.close()
 
 def get_favorites(user_id: int):
-    """Возвращает избранные картинки с file_id"""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("""
@@ -307,13 +338,19 @@ def is_favorite(user_id: int, image_id: int) -> bool:
 
 # ========================= КНОПКИ =========================
 def get_main_reply_keyboard():
-    """Постоянная Reply-клавиатура с кнопкой Меню"""
     keyboard = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📋 Меню")]],
         resize_keyboard=True,
         one_time_keyboard=False
     )
     return keyboard
+
+def subscribe_keyboard():
+    builder = InlineKeyboardBuilder()
+    for days, stars in PRICES.items():
+        builder.button(text=f"{days} дн. — {stars} Stars", callback_data=f"sub_{days}")
+    builder.adjust(1)
+    return builder.as_markup()
 
 def style_keyboard():
     builder = InlineKeyboardBuilder()
@@ -349,12 +386,13 @@ def style_prompts():
 def main_menu_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="🎨 Выбрать стиль", callback_data="show_styles")
+    builder.button(text="💎 Купить подписку", callback_data="buy_sub")
     builder.button(text="🎁 Бесплатные", callback_data="show_free")
     builder.button(text="📊 Статус", callback_data="show_status")
     builder.button(text="🎲 Случайный промт", callback_data="random_prompt")
     builder.button(text="🔥 Популярные", callback_data="show_popular")
     builder.button(text="❤️ Избранное", callback_data="show_favorites")
-    builder.button(text="📦 Ежедневный бонус", callback_data="daily_bonus")
+    builder.button(text="📦 Бонус", callback_data="daily_bonus")
     builder.adjust(2)
     return builder.as_markup()
 
@@ -367,19 +405,20 @@ def popular_prompts_keyboard():
     builder.adjust(1)
     return builder.as_markup()
 
-def after_generation_keyboard(style: str, image_id: int):
-    """Инлайн-клавиатура, которая появляется после генерации"""
+def after_generation_keyboard(style: str, image_id: int, has_subscription: bool):
+    """Инлайн-клавиатура после генерации"""
     builder = InlineKeyboardBuilder()
     builder.button(text="🔄 Ещё раз", callback_data=f"reg|{style}")
     builder.button(text="🎨 Стиль", callback_data="show_styles")
     builder.button(text="❤️ В избранное", callback_data=f"fav|{image_id}")
     builder.button(text="📊 Статус", callback_data="show_status")
+    if not has_subscription:
+        builder.button(text="💎 Купить подписку", callback_data="buy_sub")
     builder.adjust(2)
     return builder.as_markup()
 
 # ========================= GIGACHAT API =========================
 async def get_gigachat_token() -> str | None:
-    """Получает access token для GigaChat API с кешированием на 25 минут"""
     global _gigachat_token_cache
     
     now = datetime.now()
@@ -431,7 +470,6 @@ async def get_gigachat_token() -> str | None:
             return token
 
 async def generate_gigachat_image(prompt: str) -> bytes | None:
-    """Генерирует изображение через GigaChat API с повторными попытками при 429"""
     token = await get_gigachat_token()
     if not token:
         return None
@@ -533,7 +571,6 @@ user_style = {}
 
 # ==================== АНИМАЦИЯ ЗАГРУЗКИ ====================
 async def show_loading_animation(message: Message, duration: int = 30):
-    """Показывает анимацию загрузки с точками"""
     loading_message = await message.answer("🎨 Генерирую изображение")
     dots = 0
     for i in range(duration):
@@ -547,42 +584,30 @@ async def show_loading_animation(message: Message, duration: int = 30):
 
 # ==================== МОНИТОРИНГ СОСТОЯНИЯ БОТА ====================
 async def monitor_bot_status():
-    """Фоновая задача для мониторинга состояния бота и уведомления админа"""
     global bot_is_running
     last_ping_time = datetime.now()
     
     while True:
-        await asyncio.sleep(60)  # Проверяем каждую минуту
-        
+        await asyncio.sleep(60)
         try:
-            # Проверяем, что бот всё ещё подключён
             current_time = datetime.now()
-            
-            # Если бот не отвечает на запросы более 5 минут
             if bot_is_running and (current_time - last_ping_time).seconds > 300:
                 bot_is_running = False
                 await notify_admin("⚠️ **Бот не отвечает более 5 минут!**\nВозможно, сервер упал.")
-            
-            # Обновляем время последнего пинга (можно добавить реальную проверку)
             if bot_is_running:
                 last_ping_time = current_time
-                
         except Exception as e:
             logging.error(f"Monitor error: {e}")
 
 async def notify_admin(message: str):
-    """Отправляет уведомление администратору"""
     try:
         await bot.send_message(ADMIN_ID, message)
     except Exception as e:
         logging.error(f"Failed to notify admin: {e}")
 
 async def check_bot_health():
-    """Проверяет, что бот может отвечать на запросы"""
     global bot_is_running
-    
     try:
-        # Пытаемся получить информацию о боте
         me = await bot.get_me()
         if me:
             bot_is_running = True
@@ -597,7 +622,6 @@ async def check_bot_health():
 
 # ==================== ФУНКЦИИ МЕНЮ ====================
 async def set_commands():
-    """Устанавливает кнопку меню в интерфейсе Telegram"""
     commands = [
         BotCommand(command="start", description="🏠 Главное меню"),
         BotCommand(command="status", description="📊 Статус и баланс"),
@@ -628,16 +652,18 @@ async def cmd_start(message: Message):
     free_left = get_free_generations(user_id)
     style = get_user_style(user_id)
     user_style[user_id] = style
+    has_sub = has_active_subscription(user_id)
     
     welcome_text = (
         "🌟 Привет! Я генерирую крутые картинки через нейросеть GigaChat.\n\n"
         f"🎁 **У тебя есть {free_left} бесплатных генераций!**\n\n"
         "📌 **Что умею:**\n"
         "• 🎨 9 стилей генерации\n"
+        "• 💎 Подписка за Telegram Stars\n"
         "• 🎲 Случайный промт\n"
         "• 🔥 Популярные запросы\n"
         "• ❤️ Избранное\n"
-        "• 📦 Ежедневный бонус\n"
+        "• 📦 Ежедневный бонус для подписчиков\n"
         "• 🔍 Поиск по истории /search\n"
         "• 📦 Экспорт в ZIP /export\n\n"
         "👇 **Нажми кнопку \"📋 Меню\" внизу**, чтобы открыть все возможности!"
@@ -650,7 +676,6 @@ async def cmd_start(message: Message):
 
 @router.message(F.text == "📋 Меню")
 async def show_main_menu(message: Message):
-    """Обработчик нажатия на кнопку Меню"""
     await message.answer(
         "📋 **Главное меню**\n\n👇 Выбери действие:",
         reply_markup=main_menu_keyboard()
@@ -658,10 +683,8 @@ async def show_main_menu(message: Message):
 
 @router.message(Command("status_check"))
 async def cmd_status_check(message: Message):
-    """Команда для проверки статуса бота (только для админа)"""
     if message.from_user.id != ADMIN_ID:
         return
-    
     global bot_is_running
     status_text = "✅ Бот работает нормально!" if bot_is_running else "❌ Бот не отвечает!"
     await message.answer(f"🔍 **Статус бота:**\n{status_text}")
@@ -672,13 +695,22 @@ async def cmd_status(message: Message):
     free_left = get_free_generations(user_id)
     style = user_style.get(user_id, get_user_style(user_id))
     gens_today = get_daily_generations(user_id)
+    has_sub = has_active_subscription(user_id)
+    
+    if has_sub:
+        end = get_user(user_id)
+        days_left = (end - datetime.now()).days if end else 0
+        status_text = f"💎 **Подписка активна** (осталось {days_left} дн.)"
+    else:
+        status_text = "❌ **Подписка неактивна**"
     
     await message.answer(
         f"📊 **Статус**\n\n"
         f"🎨 **Стиль:** {style}\n"
+        f"{status_text}\n"
         f"🖼 **Сегодня:** {gens_today}/{DAILY_LIMIT} генераций\n"
         f"🎁 **Бесплатных осталось:** {free_left}\n\n"
-        f"📦 Ежедневный бонус: +{DAILY_BONUS} генераций",
+        f"💎 Подписка: 30 Stars/день, 150 Stars/неделя, 500 Stars/месяц",
         reply_markup=get_main_reply_keyboard()
     )
 
@@ -785,17 +817,20 @@ async def cmd_export(message: Message):
 @router.message(Command("free"))
 async def cmd_free(message: Message):
     free_left = get_free_generations(message.from_user.id)
-    await message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.\n\n📦 Ежедневный бонус: +{DAILY_BONUS} генераций в день!", reply_markup=get_main_reply_keyboard())
+    await message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.\n\n💎 Купи подписку, чтобы продолжить генерировать!", reply_markup=get_main_reply_keyboard())
 
 @router.message(Command("bonus"))
 async def cmd_bonus(message: Message):
     user_id = message.from_user.id
-    if can_claim_daily_bonus(user_id):
-        claim_daily_bonus(user_id)
-        free_left = get_free_generations(user_id)
-        await message.answer(f"✅ Ты получил ежедневный бонус +{DAILY_BONUS} генераций!\n\n🎁 Теперь у тебя {free_left} бесплатных генераций.", reply_markup=get_main_reply_keyboard())
+    if has_active_subscription(user_id):
+        if can_claim_daily_bonus(user_id):
+            claim_daily_bonus(user_id)
+            free_left = get_free_generations(user_id)
+            await message.answer(f"✅ Ты получил ежедневный бонус +{DAILY_BONUS} генераций!\n\n🎁 Теперь у тебя {free_left} бесплатных генераций.", reply_markup=get_main_reply_keyboard())
+        else:
+            await message.answer("⏳ Ты уже получал бонус сегодня. Приходи завтра!", reply_markup=get_main_reply_keyboard())
     else:
-        await message.answer("⏳ Ты уже получал бонус сегодня. Приходи завтра!", reply_markup=get_main_reply_keyboard())
+        await message.answer("❌ Ежедневный бонус доступен только для подписчиков!\n\n💎 Купи подписку, чтобы получать бонусы.", reply_markup=get_main_reply_keyboard())
 
 # ==================== АДМИН-КОМАНДЫ ====================
 @router.message(Command("admin"))
@@ -806,7 +841,7 @@ async def cmd_admin(message: Message):
         "🛠 Админ-панель:\n"
         "/stats — статистика\n"
         "/broadcast [текст] — рассылка\n"
-        "/gift [user_id] — добавить 10 бесплатных пользователю\n"
+        "/gift [user_id] — добавить 5 бесплатных пользователю\n"
         "/add_gen [user_id] [количество] — добавить генерации\n"
         "/status_check — проверить статус бота\n"
         "/health — принудительная проверка здоровья",
@@ -815,13 +850,10 @@ async def cmd_admin(message: Message):
 
 @router.message(Command("health"))
 async def cmd_health(message: Message):
-    """Принудительная проверка здоровья бота (админ)"""
     if message.from_user.id != ADMIN_ID:
         return
-    
     await message.answer("🔍 Проверяю состояние бота...")
     await check_bot_health()
-    
     global bot_is_running
     status_text = "✅ Бот работает нормально!" if bot_is_running else "❌ Бот не отвечает!"
     await message.answer(f"📊 **Результат проверки:**\n{status_text}")
@@ -834,6 +866,8 @@ async def cmd_stats(message: Message):
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM users")
     total_users = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users WHERE subscription_end > datetime('now')")
+    active_subs = cur.fetchone()[0]
     cur.execute("SELECT SUM(remaining) FROM free_generations")
     free_remaining = cur.fetchone()[0] or 0
     cur.execute("SELECT COUNT(*) FROM history")
@@ -844,6 +878,7 @@ async def cmd_stats(message: Message):
     await message.answer(
         f"📊 **Статистика**\n\n"
         f"👥 Всего пользователей: {total_users}\n"
+        f"💎 Активных подписок: {active_subs}\n"
         f"🎁 Всего бесплатных осталось: {free_remaining}\n"
         f"🖼 Всего сгенерировано: {total_images}\n"
         f"❤️ Всего в избранном: {total_favorites}",
@@ -906,6 +941,38 @@ async def cmd_broadcast(message: Message):
             pass
     await message.answer(f"Рассылка отправлена {success} пользователям.", reply_markup=get_main_reply_keyboard())
 
+# ==================== ПОДПИСКА ====================
+@router.callback_query(F.data == "buy_sub")
+async def buy_sub(callback: CallbackQuery):
+    await callback.message.answer("💎 Выбери длительность подписки:", reply_markup=subscribe_keyboard())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("sub_"))
+async def process_sub(callback: CallbackQuery):
+    days = int(callback.data.split("_")[1])
+    stars = PRICES.get(days, 30)
+    
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title=f"Подписка GigaChat — {days} дней",
+        description=f"Неограниченная генерация на {days} дней",
+        payload=f"sub_{days}",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"{days} дней", amount=stars)]
+    )
+    await callback.answer()
+
+@router.pre_checkout_query()
+async def pre_checkout(pre: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre.id, ok=True)
+
+@router.message(F.successful_payment)
+async def successful_payment(message: Message):
+    days = int(message.successful_payment.invoice_payload.split("_")[1])
+    update_subscription(message.from_user.id, days)
+    await message.answer(f"✅ Подписка активирована на {days} дней!\n\nТеперь ты можешь генерировать безлимитно и получать ежедневный бонус +{DAILY_BONUS} генераций!", reply_markup=get_main_reply_keyboard())
+
 # ==================== CALLBACK ОБРАБОТЧИКИ ====================
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery):
@@ -937,20 +1004,21 @@ async def show_status_callback(callback: CallbackQuery):
 @router.callback_query(F.data == "show_free")
 async def show_free_callback(callback: CallbackQuery):
     free_left = get_free_generations(callback.from_user.id)
-    await callback.message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.", reply_markup=get_main_reply_keyboard())
+    await callback.message.answer(f"🎁 У тебя осталось **{free_left}** бесплатных генераций из {FREE_GENERATIONS}.\n\n💎 Купи подписку, чтобы продолжить генерировать!", reply_markup=get_main_reply_keyboard())
     await callback.answer()
 
 @router.callback_query(F.data == "daily_bonus")
 async def daily_bonus_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
-    
-    if can_claim_daily_bonus(user_id):
-        claim_daily_bonus(user_id)
-        free_left = get_free_generations(user_id)
-        await callback.message.answer(f"✅ Ты получил ежедневный бонус +{DAILY_BONUS} генераций!\n\n🎁 Теперь у тебя {free_left} бесплатных генераций.", reply_markup=get_main_reply_keyboard())
+    if has_active_subscription(user_id):
+        if can_claim_daily_bonus(user_id):
+            claim_daily_bonus(user_id)
+            free_left = get_free_generations(user_id)
+            await callback.message.answer(f"✅ Ты получил ежедневный бонус +{DAILY_BONUS} генераций!\n\n🎁 Теперь у тебя {free_left} бесплатных генераций.", reply_markup=get_main_reply_keyboard())
+        else:
+            await callback.message.answer("⏳ Ты уже получал бонус сегодня. Приходи завтра!", reply_markup=get_main_reply_keyboard())
     else:
-        await callback.message.answer("⏳ Ты уже получал бонус сегодня. Приходи завтра!", reply_markup=get_main_reply_keyboard())
-    
+        await callback.message.answer("❌ Ежедневный бонус доступен только для подписчиков!\n\n💎 Купи подписку, чтобы получать бонусы.", reply_markup=get_main_reply_keyboard())
     await callback.answer()
 
 @router.callback_query(F.data == "random_prompt")
@@ -962,15 +1030,17 @@ async def random_prompt_callback(callback: CallbackQuery):
     
     last_user_prompt[user_id] = prompt
     
-    free_left = get_free_generations(user_id)
-    if free_left > 0:
-        await generate_and_send(callback.message, user_id, prompt, is_free=True)
+    if has_active_subscription(user_id):
+        await generate_and_send(callback.message, user_id, prompt, is_free=False)
     else:
-        await callback.message.answer("❌ Бесплатные генерации закончились. Получи ежедневный бонус или напиши администратору.", reply_markup=get_main_reply_keyboard())
+        free_left = get_free_generations(user_id)
+        if free_left > 0:
+            await generate_and_send(callback.message, user_id, prompt, is_free=True)
+        else:
+            await callback.message.answer("❌ Бесплатные генерации закончились.\n\n💎 Купи подписку, чтобы продолжить генерировать!", reply_markup=get_main_reply_keyboard())
 
 @router.callback_query(F.data == "show_popular")
 async def show_popular(callback: CallbackQuery):
-    """Показывает популярные промты"""
     try:
         await callback.message.edit_text(
             "🔥 Популярные промты (нажми на кнопку, чтобы выбрать):", 
@@ -1012,7 +1082,6 @@ async def show_favorites_callback(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("prompt|"))
 async def use_selected_prompt(callback: CallbackQuery):
-    """Обработчик выбора промта из популярных"""
     prompt = callback.data.split("|")[1]
     user_id = callback.from_user.id
     
@@ -1020,16 +1089,18 @@ async def use_selected_prompt(callback: CallbackQuery):
     
     last_user_prompt[user_id] = prompt
     
-    free_left = get_free_generations(user_id)
-    if free_left > 0:
-        await generate_and_send(callback.message, user_id, prompt, is_free=True)
+    if has_active_subscription(user_id):
+        await generate_and_send(callback.message, user_id, prompt, is_free=False)
     else:
-        await callback.message.answer(
-            "❌ Бесплатные генерации закончились.\n\n"
-            "📦 Получи ежедневный бонус в меню!\n"
-            "👑 Или напиши администратору.",
-            reply_markup=main_menu_keyboard()
-        )
+        free_left = get_free_generations(user_id)
+        if free_left > 0:
+            await generate_and_send(callback.message, user_id, prompt, is_free=True)
+        else:
+            await callback.message.answer(
+                "❌ Бесплатные генерации закончились.\n\n"
+                "💎 Купи подписку, чтобы продолжить генерировать!",
+                reply_markup=main_menu_keyboard()
+            )
 
 @router.callback_query(F.data.startswith("style_"))
 async def choose_style(callback: CallbackQuery):
@@ -1060,7 +1131,6 @@ async def choose_style(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("reg|"))
 async def regenerate_image(callback: CallbackQuery):
-    """Обработчик кнопки 'Ещё раз'"""
     user_id = callback.from_user.id
     update_activity(user_id)
     
@@ -1084,14 +1154,17 @@ async def regenerate_image(callback: CallbackQuery):
     
     await callback.answer("🔄 Генерирую...")
     
-    free_left = get_free_generations(user_id)
-    if free_left > 0:
-        await generate_and_send(callback.message, user_id, prompt, is_free=True)
+    if has_active_subscription(user_id):
+        await generate_and_send(callback.message, user_id, prompt, is_free=False)
     else:
-        await callback.message.answer(
-            "❌ Бесплатные генерации закончились.\n\n📦 Получи ежедневный бонус в меню!",
-            reply_markup=get_main_reply_keyboard()
-        )
+        free_left = get_free_generations(user_id)
+        if free_left > 0:
+            await generate_and_send(callback.message, user_id, prompt, is_free=True)
+        else:
+            await callback.message.answer(
+                "❌ Бесплатные генерации закончились.\n\n💎 Купи подписку, чтобы продолжить!",
+                reply_markup=get_main_reply_keyboard()
+            )
 
 @router.callback_query(F.data.startswith("fav|"))
 async def add_to_favorites_callback(callback: CallbackQuery):
@@ -1119,27 +1192,27 @@ async def handle_prompt(message: Message):
     
     prompt = message.text.strip()
     
-    # Если это команда или кнопка Меню — пропускаем
     if prompt.startswith('/') or prompt == "📋 Меню":
         return
     
     last_user_prompt[user_id] = prompt
     
-    free_left = get_free_generations(user_id)
-    
-    if free_left > 0:
-        await generate_and_send(message, user_id, prompt, is_free=True)
+    if has_active_subscription(user_id):
+        await generate_and_send(message, user_id, prompt, is_free=False)
     else:
-        await message.answer(
-            "❌ Бесплатные генерации закончились.\n\n"
-            "📦 Получи ежедневный бонус в меню!\n"
-            "👑 Или напиши администратору.",
-            reply_markup=get_main_reply_keyboard()
-        )
+        free_left = get_free_generations(user_id)
+        if free_left > 0:
+            await generate_and_send(message, user_id, prompt, is_free=True)
+        else:
+            await message.answer(
+                "❌ Бесплатные генерации закончились.\n\n"
+                "💎 Купи подписку, чтобы продолжить генерировать!\n\n"
+                "📦 Ежедневный бонус доступен только для подписчиков.",
+                reply_markup=get_main_reply_keyboard()
+            )
 
 # ==================== ФУНКЦИЯ ГЕНЕРАЦИИ ====================
 async def generate_and_send(message: Message, user_id: int, prompt: str, is_free: bool = False):
-    """Общая функция генерации и отправки с сохранением file_id и инлайн-кнопками"""
     style = user_style.get(user_id, get_user_style(user_id))
     
     style_prompts_dict = style_prompts()
@@ -1153,12 +1226,13 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
         full_prompt = full_prompt[:400]
         await message.answer("⚠️ Промт слишком длинный, я немного сократил его.", reply_markup=get_main_reply_keyboard())
     
-    daily_count = get_daily_generations(user_id)
-    if daily_count >= DAILY_LIMIT:
-        await message.answer(f"⏳ Дневной лимит ({DAILY_LIMIT}) исчерпан.\nПриходи завтра!", reply_markup=get_main_reply_keyboard())
-        return
+    # Для подписчиков дневной лимит 100 (практически безлимит), для бесплатных - 5 бесплатных всего
+    if not has_active_subscription(user_id):
+        daily_count = get_daily_generations(user_id)
+        if daily_count >= DAILY_LIMIT:
+            await message.answer(f"⏳ Дневной лимит ({DAILY_LIMIT}) исчерпан.\nПриходи завтра!", reply_markup=get_main_reply_keyboard())
+            return
     
-    # Запускаем анимацию загрузки
     loading_task = asyncio.create_task(show_loading_animation(message))
     
     try:
@@ -1177,22 +1251,18 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
         else:
             free_text = ""
         
-        # Отправляем фото БЕЗ reply_markup (чтобы не заменять reply-клавиатуру)
         photo_file = BufferedInputFile(image_bytes, filename="image.jpg")
         sent_message = await message.answer_photo(
             photo=photo_file,
             caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}"
         )
         
-        # Получаем реальный file_id отправленного фото
         if sent_message.photo:
             file_id = sent_message.photo[-1].file_id
-            
-            # Сохраняем в историю с реальным file_id
             image_id = save_to_history(user_id, prompt, file_id)
             
-            # Редактируем сообщение, добавляя ID и инлайн-кнопки
-            reply_markup = after_generation_keyboard(style, image_id)
+            has_sub = has_active_subscription(user_id)
+            reply_markup = after_generation_keyboard(style, image_id, has_sub)
             try:
                 await sent_message.edit_caption(
                     caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}\n🆔 ID: {image_id}",
@@ -1211,9 +1281,8 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
             reply_markup=get_main_reply_keyboard()
         )
 
-# ==================== HEALTH CHECK ДЛЯ RENDER ====================
+# ==================== HEALTH CHECK ====================
 async def health_check_server():
-    """Простой HTTP-сервер, чтобы Render не завершал процесс"""
     port = int(os.environ.get("PORT", 10000))
     
     async def handle_request(reader, writer):
@@ -1239,20 +1308,13 @@ async def main():
     
     init_db()
     
-    # Запускаем health check сервер
     asyncio.create_task(health_check_server())
-    
-    # Устанавливаем команды для кнопки меню в Telegram
     await set_commands()
-    
-    # Проверяем состояние бота
     await check_bot_health()
-    
-    # Запускаем мониторинг
     asyncio.create_task(monitor_bot_status())
     
-    logging.info("🚀 Бот GigaChat запущен! Все функции активны.")
-    await notify_admin("✅ **Бот успешно запущен!**\nВсе системы работают.")
+    logging.info("🚀 Бот GigaChat запущен! Подписка активна, 5 бесплатных генераций.")
+    await notify_admin("✅ **Бот успешно запущен!**\n\n🎁 5 бесплатных генераций\n💎 Подписка через Stars\n📦 Ежедневный бонус для подписчиков")
     
     await dp.start_polling(bot, skip_updates=True)
 
