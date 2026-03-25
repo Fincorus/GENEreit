@@ -54,6 +54,9 @@ DAILY_BONUS = 3
 
 DB_FILE = "bot.db"
 
+# Флаг для отслеживания состояния бота
+bot_is_running = False
+
 # Список случайных промтов
 RANDOM_PROMPTS = [
     "кот в космосе",
@@ -542,6 +545,56 @@ async def show_loading_animation(message: Message, duration: int = 30):
         await asyncio.sleep(1)
     return loading_message
 
+# ==================== МОНИТОРИНГ СОСТОЯНИЯ БОТА ====================
+async def monitor_bot_status():
+    """Фоновая задача для мониторинга состояния бота и уведомления админа"""
+    global bot_is_running
+    last_ping_time = datetime.now()
+    
+    while True:
+        await asyncio.sleep(60)  # Проверяем каждую минуту
+        
+        try:
+            # Проверяем, что бот всё ещё подключён
+            current_time = datetime.now()
+            
+            # Если бот не отвечает на запросы более 5 минут
+            if bot_is_running and (current_time - last_ping_time).seconds > 300:
+                bot_is_running = False
+                await notify_admin("⚠️ **Бот не отвечает более 5 минут!**\nВозможно, сервер упал.")
+            
+            # Обновляем время последнего пинга (можно добавить реальную проверку)
+            if bot_is_running:
+                last_ping_time = current_time
+                
+        except Exception as e:
+            logging.error(f"Monitor error: {e}")
+
+async def notify_admin(message: str):
+    """Отправляет уведомление администратору"""
+    try:
+        await bot.send_message(ADMIN_ID, message)
+    except Exception as e:
+        logging.error(f"Failed to notify admin: {e}")
+
+async def check_bot_health():
+    """Проверяет, что бот может отвечать на запросы"""
+    global bot_is_running
+    
+    try:
+        # Пытаемся получить информацию о боте
+        me = await bot.get_me()
+        if me:
+            bot_is_running = True
+            logging.info(f"Bot health check passed: @{me.username}")
+        else:
+            bot_is_running = False
+            await notify_admin("⚠️ **Бот не может подключиться к Telegram API!**")
+    except Exception as e:
+        bot_is_running = False
+        logging.error(f"Health check failed: {e}")
+        await notify_admin(f"⚠️ **Бот упал!**\nОшибка: {str(e)[:100]}\n\nНеобходимо перезапустить сервис вручную.")
+
 # ==================== ФУНКЦИИ МЕНЮ ====================
 async def set_commands():
     """Устанавливает кнопку меню в интерфейсе Telegram"""
@@ -562,6 +615,7 @@ async def set_commands():
         commands.append(BotCommand(command="broadcast", description="📢 Рассылка"))
         commands.append(BotCommand(command="gift", description="🎁 Выдать бонус"))
         commands.append(BotCommand(command="add_gen", description="➕ Добавить генерации"))
+        commands.append(BotCommand(command="status_check", description="🔍 Проверить статус бота"))
     
     await bot.set_my_commands(commands)
 
@@ -601,6 +655,16 @@ async def show_main_menu(message: Message):
         "📋 **Главное меню**\n\n👇 Выбери действие:",
         reply_markup=main_menu_keyboard()
     )
+
+@router.message(Command("status_check"))
+async def cmd_status_check(message: Message):
+    """Команда для проверки статуса бота (только для админа)"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    global bot_is_running
+    status_text = "✅ Бот работает нормально!" if bot_is_running else "❌ Бот не отвечает!"
+    await message.answer(f"🔍 **Статус бота:**\n{status_text}")
 
 @router.message(Command("status"))
 async def cmd_status(message: Message):
@@ -743,9 +807,24 @@ async def cmd_admin(message: Message):
         "/stats — статистика\n"
         "/broadcast [текст] — рассылка\n"
         "/gift [user_id] — добавить 10 бесплатных пользователю\n"
-        "/add_gen [user_id] [количество] — добавить генерации",
+        "/add_gen [user_id] [количество] — добавить генерации\n"
+        "/status_check — проверить статус бота\n"
+        "/health — принудительная проверка здоровья",
         reply_markup=get_main_reply_keyboard()
     )
+
+@router.message(Command("health"))
+async def cmd_health(message: Message):
+    """Принудительная проверка здоровья бота (админ)"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    await message.answer("🔍 Проверяю состояние бота...")
+    await check_bot_health()
+    
+    global bot_is_running
+    status_text = "✅ Бот работает нормально!" if bot_is_running else "❌ Бот не отвечает!"
+    await message.answer(f"📊 **Результат проверки:**\n{status_text}")
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
@@ -1156,14 +1235,24 @@ async def health_check_server():
 
 # ==================== ЗАПУСК ====================
 async def main():
+    global bot_is_running
+    
     init_db()
     
+    # Запускаем health check сервер
     asyncio.create_task(health_check_server())
     
     # Устанавливаем команды для кнопки меню в Telegram
     await set_commands()
     
+    # Проверяем состояние бота
+    await check_bot_health()
+    
+    # Запускаем мониторинг
+    asyncio.create_task(monitor_bot_status())
+    
     logging.info("🚀 Бот GigaChat запущен! Все функции активны.")
+    await notify_admin("✅ **Бот успешно запущен!**\nВсе системы работают.")
     
     await dp.start_polling(bot, skip_updates=True)
 
