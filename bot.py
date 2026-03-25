@@ -16,7 +16,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    Message, BufferedInputFile, FSInputFile
+    Message, BufferedInputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
@@ -225,28 +225,33 @@ def get_daily_generations(user_id: int) -> int:
     conn.close()
     return count
 
-def save_to_history(user_id: int, prompt: str, image_url: str) -> int:
+def save_to_history(user_id: int, prompt: str, file_id: str) -> int:
+    """Сохраняет file_id изображения в историю"""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("INSERT INTO history (user_id, prompt, image_url) VALUES (?, ?, ?)", (user_id, prompt, image_url))
+    cur.execute("INSERT INTO history (user_id, prompt, image_url) VALUES (?, ?, ?)", 
+                (user_id, prompt, file_id))
     image_id = cur.lastrowid
     conn.commit()
     conn.close()
     return image_id
 
 def get_history(user_id: int, limit=5, search=None):
+    """Возвращает историю с file_id"""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     if search:
         cur.execute("SELECT id, prompt, image_url FROM history WHERE user_id = ? AND prompt LIKE ? ORDER BY created_at DESC LIMIT ?", 
                     (user_id, f"%{search}%", limit))
     else:
-        cur.execute("SELECT id, prompt, image_url FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT ?", (user_id, limit))
+        cur.execute("SELECT id, prompt, image_url FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT ?", 
+                    (user_id, limit))
     rows = cur.fetchall()
     conn.close()
     return rows
 
 def get_all_history(user_id: int):
+    """Возвращает всю историю для экспорта"""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("SELECT id, prompt, image_url FROM history WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
@@ -274,6 +279,7 @@ def remove_from_favorites(user_id: int, image_id: int):
     conn.close()
 
 def get_favorites(user_id: int):
+    """Возвращает избранные картинки с file_id"""
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
     cur.execute("""
@@ -600,11 +606,19 @@ async def show_favorites(callback: CallbackQuery):
         return
     
     await callback.message.answer(f"❤️ Твои избранные картинки ({len(favorites)}):")
-    for img_id, prompt, url in favorites[:5]:
-        await callback.message.answer_photo(photo=url, caption=f"📝 {prompt[:60]}\n🆔 ID: {img_id}")
     
-    if len(favorites) > 5:
-        await callback.message.answer(f"📌 Показано 5 из {len(favorites)}. Используй /favorites для просмотра всех.")
+    for img_id, prompt, file_id in favorites:
+        try:
+            await callback.message.answer_photo(
+                photo=file_id,
+                caption=f"📝 {prompt[:60]}\n🆔 ID: {img_id}\n❤️ В избранном"
+            )
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logging.error(f"Error showing favorite {img_id}: {e}")
+            # Если file_id не работает, пробуем удалить из избранного
+            remove_from_favorites(user_id, img_id)
+            await callback.message.answer(f"⚠️ Картинка {img_id} недоступна, удалена из избранного.")
     
     await callback.answer()
 
@@ -750,7 +764,7 @@ async def handle_prompt(message: Message):
         )
 
 async def generate_and_send(message: Message, user_id: int, prompt: str, is_free: bool = False):
-    """Общая функция генерации и отправки с анимацией загрузки"""
+    """Общая функция генерации и отправки с сохранением file_id"""
     style = user_style.get(user_id, get_user_style(user_id))
     
     style_prompts_dict = style_prompts()
@@ -779,7 +793,6 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
         await message.answer("⚠️ Ошибка при генерации. Попробуй более простой промт.")
         return
     finally:
-        # Останавливаем анимацию
         loading_task.cancel()
     
     if image_bytes:
@@ -789,18 +802,29 @@ async def generate_and_send(message: Message, user_id: int, prompt: str, is_free
         else:
             free_text = ""
         
+        # Отправляем фото
         photo_file = BufferedInputFile(image_bytes, filename="image.jpg")
-        
-        # Сохраняем в историю и получаем ID
-        image_id = save_to_history(user_id, prompt, "gigachat_generated")
-        
-        reply_markup = after_generation_keyboard(style, image_id)
-        
-        await message.answer_photo(
+        sent_message = await message.answer_photo(
             photo=photo_file,
-            caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}\n🆔 ID: {image_id}",
-            reply_markup=reply_markup
+            caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}"
         )
+        
+        # Получаем реальный file_id отправленного фото
+        if sent_message.photo:
+            file_id = sent_message.photo[-1].file_id
+            
+            # Сохраняем в историю с реальным file_id
+            image_id = save_to_history(user_id, prompt, file_id)
+            
+            # Редактируем сообщение, добавляя ID и кнопки
+            reply_markup = after_generation_keyboard(style, image_id)
+            try:
+                await sent_message.edit_caption(
+                    caption=f"✨ Готово!\nСтиль: {style}\nПромт: {prompt[:60]}...{free_text}\n🆔 ID: {image_id}",
+                    reply_markup=reply_markup
+                )
+            except Exception as e:
+                logging.error(f"Error editing caption: {e}")
     else:
         await message.answer(
             "⚠️ Не удалось сгенерировать изображение.\n\n"
@@ -837,9 +861,17 @@ async def cmd_history(message: Message):
         return
     
     await message.answer(f"🖼 Последние 5 генераций:")
-    for img_id, prompt, url in rows:
-        fav_mark = "❤️ " if is_favorite(user_id, img_id) else ""
-        await message.answer_photo(photo=url, caption=f"{fav_mark}📝 {prompt[:80]}\n🆔 ID: {img_id}")
+    for img_id, prompt, file_id in rows:
+        try:
+            fav_mark = "❤️ " if is_favorite(user_id, img_id) else ""
+            await message.answer_photo(
+                photo=file_id,
+                caption=f"{fav_mark}📝 {prompt[:80]}\n🆔 ID: {img_id}"
+            )
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logging.error(f"Error showing history {img_id}: {e}")
+            await message.answer(f"⚠️ Картинка {img_id} недоступна.")
 
 @router.message(Command("search"))
 async def cmd_search(message: Message):
@@ -857,8 +889,15 @@ async def cmd_search(message: Message):
         return
     
     await message.answer(f"🔍 Результаты поиска '{search_text}':")
-    for img_id, prompt, url in rows:
-        await message.answer_photo(photo=url, caption=f"📝 {prompt[:80]}\n🆔 ID: {img_id}")
+    for img_id, prompt, file_id in rows:
+        try:
+            await message.answer_photo(
+                photo=file_id,
+                caption=f"📝 {prompt[:80]}\n🆔 ID: {img_id}"
+            )
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logging.error(f"Error showing search result {img_id}: {e}")
 
 @router.message(Command("favorites"))
 async def cmd_favorites(message: Message):
@@ -870,8 +909,17 @@ async def cmd_favorites(message: Message):
         return
     
     await message.answer(f"❤️ Твои избранные картинки ({len(favorites)}):")
-    for img_id, prompt, url in favorites:
-        await message.answer_photo(photo=url, caption=f"📝 {prompt[:80]}\n🆔 ID: {img_id}")
+    for img_id, prompt, file_id in favorites:
+        try:
+            await message.answer_photo(
+                photo=file_id,
+                caption=f"📝 {prompt[:80]}\n🆔 ID: {img_id}"
+            )
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logging.error(f"Error showing favorite {img_id}: {e}")
+            remove_from_favorites(user_id, img_id)
+            await message.answer(f"⚠️ Картинка {img_id} недоступна, удалена из избранного.")
 
 @router.message(Command("export"))
 async def cmd_export(message: Message):
@@ -886,15 +934,14 @@ async def cmd_export(message: Message):
     
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for idx, (img_id, prompt, url) in enumerate(history):
+        for idx, (img_id, prompt, file_id) in enumerate(history):
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url) as resp:
-                        if resp.status == 200:
-                            image_bytes = await resp.read()
-                            safe_prompt = "".join(c for c in prompt[:30] if c.isalnum() or c in " _-").strip()
-                            filename = f"{idx+1:03d}_{safe_prompt}.jpg"
-                            zip_file.writestr(filename, image_bytes)
+                # Получаем файл по file_id
+                file = await bot.get_file(file_id)
+                file_bytes = await bot.download_file(file.file_path)
+                safe_prompt = "".join(c for c in prompt[:30] if c.isalnum() or c in " _-").strip()
+                filename = f"{idx+1:03d}_{safe_prompt}.jpg"
+                zip_file.writestr(filename, file_bytes.read())
                 await asyncio.sleep(0.1)
             except Exception as e:
                 logging.error(f"Export error for {img_id}: {e}")
